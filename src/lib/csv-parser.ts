@@ -29,12 +29,20 @@ interface CSVMatchResult {
 }
 
 // Map common TenantCloud column names to our fields
+// TenantCloud actual headers: Transaction ID, Status, Date created, Due date,
+// Date paid, Type, Transaction category, Currency, Total amount, Paid amount,
+// Left amount, Method of payment, Payer/payee, Payer/payee email, Lease #,
+// Property name, Unit #, Street address, City, State/Region, Zip, Country,
+// Transaction details, Tags
 const COLUMN_MAPPINGS: Record<string, string[]> = {
-  tenantName: ['tenant name', 'tenant', 'name', 'resident', 'resident name', 'renter'],
-  amount: ['amount', 'payment amount', 'paid', 'total', 'rent paid'],
-  paymentDate: ['date', 'payment date', 'paid date', 'transaction date'],
-  paymentType: ['payment method', 'method', 'type', 'payment type'],
+  tenantName: ['payer/payee', 'tenant name', 'tenant', 'name', 'resident', 'resident name', 'renter'],
+  amount: ['paid amount', 'total amount', 'amount', 'payment amount', 'paid', 'total', 'rent paid'],
+  paymentDate: ['date paid', 'date created', 'due date', 'date', 'payment date', 'paid date', 'transaction date'],
+  paymentType: ['method of payment', 'payment method', 'method', 'type', 'payment type'],
   status: ['status', 'payment status'],
+  suiteNumber: ['unit #', 'unit', 'suite', 'suite number'],
+  transactionId: ['transaction id', 'id', 'reference'],
+  type: ['type', 'transaction category'],
 }
 
 function findColumn(headers: string[], field: string): string | null {
