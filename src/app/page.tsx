@@ -9,7 +9,7 @@ import { TenantWeekEntry, WeekStatus, PaymentType, BillingFrequency } from '@/ty
 import { TENANTS, generateWeekEntries } from '@/lib/tenant-data'
 import { formatCurrency, getStatusLabel, getStatusColor, getCurrentRentWeek, cn } from '@/lib/utils'
 import { generateWeeklyPDF } from '@/lib/pdf-generator'
-import { parseAndMatchCSV, getCSVPreview, getCSVHeaders } from '@/lib/csv-parser'
+import { parseAndMatchCSV, getCSVPreview, getCSVHeaders, extractDueDates, CSVMatchResult } from '@/lib/csv-parser'
 
 const WEEK_STATUSES: WeekStatus[] = ['paid', 'partial', 'late', 'unpaid', 'free_week', 'comped_week']
 const PAYMENT_TYPES: PaymentType[] = ['ACH', 'Zelle', 'Check', 'Cash', 'Money Order', 'Card']
@@ -28,7 +28,10 @@ export default function WeeklyReport() {
   const [editingCell, setEditingCell] = useState<string | null>(null)
   const [showImport, setShowImport] = useState(false)
   const [showManualEntry, setShowManualEntry] = useState(false)
-  const [importResult, setImportResult] = useState<any>(null)
+  const [importResult, setImportResult] = useState<CSVMatchResult | null>(null)
+  const [csvText, setCsvText] = useState<string | null>(null)
+  const [availableDueDates, setAvailableDueDates] = useState<string[]>([])
+  const [showDatePicker, setShowDatePicker] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
 
   // Update a single entry
@@ -102,44 +105,61 @@ export default function WeeklyReport() {
     }
   }, [entries])
 
-  // Handle CSV import
-  const handleCSVImport = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+  // Handle CSV file selection — Step 1: read file and show date picker
+  const handleCSVFileSelect = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
     if (!file) return
 
     const reader = new FileReader()
     reader.onload = (event) => {
-      const csvText = event.target?.result as string
+      const text = event.target?.result as string
+      setCsvText(text)
       try {
-        const result = parseAndMatchCSV(csvText, TENANTS)
-        setImportResult(result)
-
-        // Auto-apply matched payments
-        setEntries(prev => {
-          const updated = [...prev]
-          for (const match of result.matched) {
-            const idx = updated.findIndex(e => e.tenant.id === match.tenant.id)
-            if (idx !== -1) {
-              updated[idx] = {
-                ...updated[idx],
-                amountPaid: match.amount,
-                paymentType: match.paymentType,
-                status: match.amount >= updated[idx].amountDue ? 'paid' : 'partial',
-                confirmation: match.paymentType === 'ACH' || match.paymentType === 'Card' ? 'Card Processed' : undefined,
-              }
-            }
-          }
-          return updated
-        })
-
-        setShowImport(true)
+        const dates = extractDueDates(text)
+        setAvailableDueDates(dates)
+        if (dates.length > 1) {
+          // Multiple due dates found — show picker
+          setShowDatePicker(true)
+        } else {
+          // Single date or no date column — import directly
+          runCSVImport(text, dates[0] || undefined)
+        }
       } catch (err) {
-        alert('Error parsing CSV: ' + (err as Error).message)
+        alert('Error reading CSV: ' + (err as Error).message)
       }
     }
     reader.readAsText(file)
-    // Reset input
     if (fileInputRef.current) fileInputRef.current.value = ''
+  }, [])
+
+  // Handle CSV import — Step 2: run import with selected due date
+  const runCSVImport = useCallback((text: string, selectedDueDate?: string) => {
+    try {
+      const result = parseAndMatchCSV(text, TENANTS, selectedDueDate)
+      setImportResult(result)
+      setShowDatePicker(false)
+      setCsvText(null)
+
+      // Auto-apply matched payments
+      setEntries(prev => {
+        const updated = [...prev]
+        for (const match of result.matched) {
+          const idx = updated.findIndex(e => e.tenant.id === match.tenant.id)
+          if (idx !== -1) {
+            updated[idx] = {
+              ...updated[idx],
+              amountPaid: match.amount,
+              paymentType: match.paymentType,
+              status: match.amount >= updated[idx].amountDue ? 'paid' : 'partial',
+              confirmation: match.paymentType === 'ACH' || match.paymentType === 'Card' ? 'Card Processed' : undefined,
+            }
+          }
+        }
+        return updated
+      })
+    } catch (err) {
+      alert('Error parsing CSV: ' + (err as Error).message)
+    }
   }, [])
 
   // Generate PDF
@@ -211,7 +231,7 @@ export default function WeeklyReport() {
               ref={fileInputRef}
               type="file"
               accept=".csv,.xlsx"
-              onChange={handleCSVImport}
+              onChange={handleCSVFileSelect}
               className="hidden"
             />
             <button
@@ -268,7 +288,10 @@ export default function WeeklyReport() {
         {importResult && (
           <div className="bg-blue-50 border border-blue-200 rounded-lg p-3 mb-4 flex items-center justify-between">
             <div className="text-sm text-blue-800">
-              <strong>CSV Import:</strong> {importResult.matched.length} matched,{' '}
+              <strong>CSV Import:</strong> {importResult.matched.length} matched
+              {importResult.matched.some((m: any) => m.matchMethod === 'suite') &&
+                ` (${importResult.matched.filter((m: any) => m.matchMethod === 'suite').length} by suite #)`
+              },{' '}
               {importResult.unmatched.length} unmatched,{' '}
               {importResult.skipped.length} skipped
             </div>
@@ -342,6 +365,35 @@ export default function WeeklyReport() {
           </div>
         </div>
       </div>
+
+      {/* Due Date Picker Modal */}
+      {showDatePicker && csvText && (
+        <Modal onClose={() => { setShowDatePicker(false); setCsvText(null) }} title="Select Rent Week">
+          <div className="space-y-3">
+            <p className="text-sm text-gray-600">
+              This CSV contains payments for multiple due dates. Which Friday are you importing for?
+            </p>
+            <div className="space-y-2">
+              {availableDueDates.map(date => (
+                <button
+                  key={date}
+                  onClick={() => runCSVImport(csvText, date)}
+                  className="w-full text-left px-4 py-3 border border-gray-200 rounded-lg hover:bg-blue-50 hover:border-blue-300 transition-colors flex items-center justify-between"
+                >
+                  <span className="text-sm font-medium text-gray-900">{date}</span>
+                  <span className="text-xs text-gray-500">Select</span>
+                </button>
+              ))}
+            </div>
+            <button
+              onClick={() => runCSVImport(csvText, undefined)}
+              className="w-full text-center px-4 py-2 text-sm text-gray-500 hover:text-gray-700"
+            >
+              Import all dates
+            </button>
+          </div>
+        </Modal>
+      )}
 
       {/* Manual Entry Modal */}
       {showManualEntry && (
