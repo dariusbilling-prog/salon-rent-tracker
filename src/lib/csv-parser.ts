@@ -186,14 +186,15 @@ export function parseAndMatchCSV(
   const result: CSVMatchResult = { matched: [], unmatched: [], skipped: [], availableDueDates }
 
   // Track amounts per suite for combining split payments (like Suite 135)
-  const suitePayments: Map<string, {
+  type SuitePaymentData = {
     tenant: Tenant
     totalAmount: number
     paymentType: PaymentType
     rows: CSVRow[]
     names: string[]
     matchMethod: 'suite' | 'exact' | 'fuzzy'
-  }> = new Map()
+  }
+  const suitePayments = new Map<string, SuitePaymentData>()
 
   for (const row of parsed.data) {
     const rawName = row[nameCol]?.trim()
@@ -340,7 +341,7 @@ export function parseAndMatchCSV(
   }
 
   // Convert combined suite payments into matched results
-  for (const [, data] of suitePayments) {
+  Array.from(suitePayments.values()).forEach((data) => {
     result.matched.push({
       csvRow: data.rows[0], // primary row
       tenant: data.tenant,
@@ -351,7 +352,7 @@ export function parseAndMatchCSV(
       csvName: data.names.join(', '),
       csvUnit: data.rows[0]?.[findColumn(parsed.meta.fields || [], 'suiteNumber') || ''] || '',
     })
-  }
+  })
 
   return result
 }
