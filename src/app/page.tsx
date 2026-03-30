@@ -3,13 +3,15 @@
 import { useState, useMemo, useCallback, useRef } from 'react'
 import {
   Upload, Plus, FileDown, ChevronLeft, ChevronRight,
-  Check, AlertCircle, Clock, Gift, Heart, Calendar, Repeat
+  Check, AlertCircle, Clock, Gift, Heart, Calendar, Repeat,
+  MessageSquare, Phone, Send, Loader2, StickyNote, X
 } from 'lucide-react'
 import { TenantWeekEntry, WeekStatus, PaymentType, BillingFrequency } from '@/types'
 import { TENANTS, generateWeekEntries } from '@/lib/tenant-data'
-import { formatCurrency, getStatusLabel, getStatusColor, getCurrentRentWeek, cn } from '@/lib/utils'
+import { formatCurrency, getStatusLabel, getStatusColor, cn } from '@/lib/utils'
 import { generateWeeklyPDF } from '@/lib/pdf-generator'
-import { parseAndMatchCSV, getCSVPreview, getCSVHeaders, extractDueDates, CSVMatchResult } from '@/lib/csv-parser'
+import { parseAndMatchCSV, extractDueDates, CSVMatchResult } from '@/lib/csv-parser'
+import { buildReminderMessage, formatPhoneForSMS } from '@/lib/sms'
 
 const WEEK_STATUSES: WeekStatus[] = ['paid', 'partial', 'late', 'unpaid', 'free_week', 'comped_week']
 const PAYMENT_TYPES: PaymentType[] = ['ACH', 'Zelle', 'Check', 'Cash', 'Money Order', 'Card']
@@ -21,17 +23,56 @@ const FREQUENCY_LABELS: Record<BillingFrequency, string> = {
   'monthly': 'Monthly',
 }
 
+// Helper to get Friday date from an offset in weeks from current
+function getFridayForWeek(weekOffset: number): { weekLabel: string; weekKey: string; fridayDate: Date } {
+  const today = new Date()
+  const day = today.getDay()
+  const daysFromMonday = day === 0 ? 6 : day - 1
+  const monday = new Date(today)
+  monday.setDate(today.getDate() - daysFromMonday)
+  monday.setDate(monday.getDate() + weekOffset * 7)
+  const friday = new Date(monday)
+  friday.setDate(monday.getDate() + 4)
+  const weekLabel = `Friday ${friday.getMonth() + 1}/${friday.getDate()}/${friday.getFullYear().toString().slice(-2)}`
+  const weekKey = `${friday.getFullYear()}-${String(friday.getMonth() + 1).padStart(2, '0')}-${String(friday.getDate()).padStart(2, '0')}`
+  return { weekLabel, weekKey, fridayDate: friday }
+}
+
 export default function WeeklyReport() {
-  const currentWeek = getCurrentRentWeek()
-  const [weekLabel, setWeekLabel] = useState(currentWeek.weekLabel)
-  const [entries, setEntries] = useState<TenantWeekEntry[]>(() => generateWeekEntries(TENANTS))
+  const [weekOffset, setWeekOffset] = useState(0)
+  const { weekLabel, weekKey } = getFridayForWeek(weekOffset)
+
+  // Store week data keyed by weekKey so you can navigate between weeks
+  const [weekDataMap, setWeekDataMap] = useState<Record<string, TenantWeekEntry[]>>(() => ({
+    [weekKey]: generateWeekEntries(TENANTS),
+  }))
+
+  // Get current week's entries, or generate fresh if navigating to a new week
+  const entries = weekDataMap[weekKey] || generateWeekEntries(TENANTS)
+
+  // Wrap setEntries to also update the map
+  const setEntries = useCallback((updater: TenantWeekEntry[] | ((prev: TenantWeekEntry[]) => TenantWeekEntry[])) => {
+    setWeekDataMap(prev => {
+      const currentEntries = prev[weekKey] || generateWeekEntries(TENANTS)
+      const newEntries = typeof updater === 'function' ? updater(currentEntries) : updater
+      return { ...prev, [weekKey]: newEntries }
+    })
+  }, [weekKey])
+
+  // Navigate weeks
+  const goToPrevWeek = useCallback(() => setWeekOffset(o => o - 1), [])
+  const goToNextWeek = useCallback(() => setWeekOffset(o => o + 1), [])
+
   const [editingCell, setEditingCell] = useState<string | null>(null)
-  const [showImport, setShowImport] = useState(false)
   const [showManualEntry, setShowManualEntry] = useState(false)
   const [importResult, setImportResult] = useState<CSVMatchResult | null>(null)
   const [csvText, setCsvText] = useState<string | null>(null)
   const [availableDueDates, setAvailableDueDates] = useState<string[]>([])
   const [showDatePicker, setShowDatePicker] = useState(false)
+  const [showSMSPreview, setShowSMSPreview] = useState(false)
+  const [smsLoading, setSmsLoading] = useState(false)
+  const [smsResults, setSmsResults] = useState<Array<{ tenantName: string; suiteNumber: string; success: boolean; error?: string }> | null>(null)
+  const [smsSentThisWeek, setSmsSentThisWeek] = useState<Set<string>>(new Set())
   const fileInputRef = useRef<HTMLInputElement>(null)
 
   // Update a single entry
@@ -79,6 +120,74 @@ export default function WeeklyReport() {
       return { ...e, tenant: updatedTenant, status }
     }))
   }, [])
+
+  // Update tenant phone number
+  const updatePhone = useCallback((tenantId: string, phone: string) => {
+    setEntries(prev => prev.map(e => {
+      if (e.tenant.id !== tenantId) return e
+      return { ...e, tenant: { ...e.tenant, phone } }
+    }))
+  }, [])
+
+  // Get late tenants (unpaid/late with phone numbers)
+  const getLateTenants = useCallback(() => {
+    return entries.filter(e =>
+      !e.isVacant &&
+      (e.status === 'unpaid' || e.status === 'late') &&
+      e.tenant.billingFrequency === 'weekly' && // Only weekly tenants
+      e.tenant.phone &&
+      e.tenant.phone.trim() !== '' &&
+      formatPhoneForSMS(e.tenant.phone) !== null &&
+      !smsSentThisWeek.has(e.tenant.id)
+    )
+  }, [entries, smsSentThisWeek])
+
+  // Send late reminders
+  const handleSendReminders = useCallback(async () => {
+    const lateTenants = getLateTenants()
+    if (lateTenants.length === 0) return
+
+    setSmsLoading(true)
+    setSmsResults(null)
+
+    try {
+      const response = await fetch('/api/send-reminders', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          tenants: lateTenants.map(e => ({
+            tenantName: e.tenant.name,
+            suiteNumber: e.tenant.suiteNumber,
+            phone: e.tenant.phone,
+          }))
+        })
+      })
+
+      const data = await response.json()
+
+      if (!response.ok) {
+        alert(data.error || 'Failed to send reminders')
+        setSmsLoading(false)
+        return
+      }
+
+      setSmsResults(data.results)
+
+      // Track sent messages to prevent double-sending
+      const sentIds = new Set(smsSentThisWeek)
+      for (const result of data.results) {
+        if (result.success) {
+          const entry = lateTenants.find(e => e.tenant.suiteNumber === result.suiteNumber)
+          if (entry) sentIds.add(entry.tenant.id)
+        }
+      }
+      setSmsSentThisWeek(sentIds)
+    } catch (err) {
+      alert('Error sending reminders: ' + (err as Error).message)
+    } finally {
+      setSmsLoading(false)
+    }
+  }, [getLateTenants, smsSentThisWeek])
 
   // Stats
   const stats = useMemo(() => {
@@ -170,8 +279,8 @@ export default function WeeklyReport() {
       totalDue: stats.totalDue,
       totalPaid: stats.totalPaid,
     })
-    doc.save(`Salon_Boutique_Report_${currentWeek.weekStart}.pdf`)
-  }, [weekLabel, entries, stats, currentWeek])
+    doc.save(`Salon_Boutique_Report_${weekKey}.pdf`)
+  }, [weekLabel, entries, stats, weekKey])
 
   // Manual entry quick-add
   const [manualForm, setManualForm] = useState({
@@ -216,13 +325,13 @@ export default function WeeklyReport() {
             <p className="text-xs text-gray-500">Weekly Rent Report</p>
           </div>
           <div className="flex items-center gap-2">
-            <button className="p-1.5 text-gray-400 hover:text-gray-600 rounded">
+            <button onClick={goToPrevWeek} className="p-1.5 text-gray-400 hover:text-gray-600 rounded">
               <ChevronLeft size={18} />
             </button>
             <span className="text-sm font-semibold text-gray-800 bg-gray-100 px-3 py-1.5 rounded-lg">
               {weekLabel}
             </span>
-            <button className="p-1.5 text-gray-400 hover:text-gray-600 rounded">
+            <button onClick={goToNextWeek} className="p-1.5 text-gray-400 hover:text-gray-600 rounded">
               <ChevronRight size={18} />
             </button>
           </div>
@@ -245,6 +354,12 @@ export default function WeeklyReport() {
               className="px-3 py-1.5 bg-white text-gray-700 text-sm font-medium rounded-lg border border-gray-300 hover:bg-gray-50 flex items-center gap-1.5"
             >
               <Plus size={14} /> Manual Entry
+            </button>
+            <button
+              onClick={() => setShowSMSPreview(true)}
+              className="px-3 py-1.5 bg-orange-500 text-white text-sm font-medium rounded-lg hover:bg-orange-600 flex items-center gap-1.5"
+            >
+              <MessageSquare size={14} /> Late Reminders
             </button>
             <button
               onClick={handleExportPDF}
@@ -319,6 +434,7 @@ export default function WeeklyReport() {
                   <Th className="w-28">Status</Th>
                   <Th className="w-20">Confirm</Th>
                   <Th className="w-14 text-center">Chk #</Th>
+                  <Th className="w-28">Phone</Th>
                   <Th>Notes</Th>
                 </tr>
               </thead>
@@ -329,6 +445,7 @@ export default function WeeklyReport() {
                     entry={entry}
                     onUpdate={updateEntry}
                     onFrequencyChange={updateFrequency}
+                    onPhoneChange={updatePhone}
                     isEditing={editingCell === entry.tenant.id}
                     onStartEdit={() => setEditingCell(entry.tenant.id)}
                     onStopEdit={() => setEditingCell(null)}
@@ -346,7 +463,7 @@ export default function WeeklyReport() {
                   <td className="px-3 py-2 text-sm font-bold text-green-700 text-right font-mono">
                     {formatCurrency(stats.totalPaid)}
                   </td>
-                  <td colSpan={5}></td>
+                  <td colSpan={6}></td>
                 </tr>
               </tfoot>
             </table>
@@ -477,6 +594,143 @@ export default function WeeklyReport() {
           </div>
         </Modal>
       )}
+
+      {/* SMS Late Reminder Preview Modal */}
+      {showSMSPreview && (
+        <Modal onClose={() => { setShowSMSPreview(false); setSmsResults(null) }} title="Send Late Rent Reminders">
+          <div className="space-y-4">
+            {/* Show results if we just sent */}
+            {smsResults ? (
+              <div className="space-y-3">
+                <div className="flex items-center gap-2 text-sm font-medium text-gray-700">
+                  <Check size={16} className="text-green-600" />
+                  {smsResults.filter(r => r.success).length} sent, {smsResults.filter(r => !r.success).length} failed
+                </div>
+                <div className="max-h-60 overflow-y-auto space-y-1">
+                  {smsResults.map((r, i) => (
+                    <div key={i} className={cn(
+                      'text-xs px-3 py-2 rounded flex items-center justify-between',
+                      r.success ? 'bg-green-50 text-green-800' : 'bg-red-50 text-red-800'
+                    )}>
+                      <span>{r.suiteNumber} — {r.tenantName}</span>
+                      <span>{r.success ? 'Sent' : r.error || 'Failed'}</span>
+                    </div>
+                  ))}
+                </div>
+                <button
+                  onClick={() => { setShowSMSPreview(false); setSmsResults(null) }}
+                  className="w-full px-4 py-2 bg-gray-100 text-gray-700 text-sm font-medium rounded-lg hover:bg-gray-200"
+                >
+                  Done
+                </button>
+              </div>
+            ) : (
+              <>
+                {/* Preview message */}
+                <div className="bg-gray-50 rounded-lg p-3 border border-gray-200">
+                  <p className="text-xs font-medium text-gray-500 uppercase tracking-wider mb-1">Message Preview</p>
+                  <p className="text-sm text-gray-800 italic">
+                    &ldquo;{buildReminderMessage('Tenant Name')}&rdquo;
+                  </p>
+                </div>
+
+                {/* List of who will receive it */}
+                {(() => {
+                  const lateTenants = getLateTenants()
+                  const lateNoPhone = entries.filter(e =>
+                    !e.isVacant &&
+                    (e.status === 'unpaid' || e.status === 'late') &&
+                    e.tenant.billingFrequency === 'weekly' &&
+                    (!e.tenant.phone || e.tenant.phone.trim() === '')
+                  )
+                  const alreadySent = entries.filter(e =>
+                    !e.isVacant &&
+                    (e.status === 'unpaid' || e.status === 'late') &&
+                    smsSentThisWeek.has(e.tenant.id)
+                  )
+
+                  return (
+                    <div className="space-y-3">
+                      {lateTenants.length > 0 ? (
+                        <div>
+                          <p className="text-xs font-medium text-gray-500 uppercase tracking-wider mb-2">
+                            Will receive text ({lateTenants.length})
+                          </p>
+                          <div className="max-h-40 overflow-y-auto space-y-1">
+                            {lateTenants.map(e => (
+                              <div key={e.tenant.id} className="text-xs bg-orange-50 text-orange-800 px-3 py-2 rounded flex items-center justify-between">
+                                <span className="font-medium">{e.tenant.suiteNumber} — {e.tenant.name}</span>
+                                <span className="text-orange-500 flex items-center gap-1">
+                                  <Phone size={10} /> {e.tenant.phone}
+                                </span>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="text-sm text-gray-500 text-center py-4">
+                          No tenants to text. Either everyone paid, no one has a phone number entered, or reminders were already sent.
+                        </div>
+                      )}
+
+                      {lateNoPhone.length > 0 && (
+                        <div>
+                          <p className="text-xs font-medium text-gray-400 uppercase tracking-wider mb-2">
+                            Missing phone number ({lateNoPhone.length})
+                          </p>
+                          <div className="max-h-32 overflow-y-auto space-y-1">
+                            {lateNoPhone.map(e => (
+                              <div key={e.tenant.id} className="text-xs bg-gray-50 text-gray-500 px-3 py-2 rounded flex items-center justify-between">
+                                <span>{e.tenant.suiteNumber} — {e.tenant.name}</span>
+                                <span className="text-gray-400 italic">No phone</span>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      {alreadySent.length > 0 && (
+                        <div>
+                          <p className="text-xs font-medium text-green-500 uppercase tracking-wider mb-2">
+                            Already sent this week ({alreadySent.length})
+                          </p>
+                          <div className="max-h-20 overflow-y-auto space-y-1">
+                            {alreadySent.map(e => (
+                              <div key={e.tenant.id} className="text-xs bg-green-50 text-green-600 px-3 py-2 rounded">
+                                {e.tenant.suiteNumber} — {e.tenant.name}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      <div className="flex gap-2 pt-2">
+                        <button
+                          onClick={handleSendReminders}
+                          disabled={lateTenants.length === 0 || smsLoading}
+                          className="flex-1 px-4 py-2 bg-orange-500 text-white text-sm font-medium rounded-lg hover:bg-orange-600 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+                        >
+                          {smsLoading ? (
+                            <><Loader2 size={14} className="animate-spin" /> Sending...</>
+                          ) : (
+                            <><Send size={14} /> Send {lateTenants.length} Reminder{lateTenants.length !== 1 ? 's' : ''}</>
+                          )}
+                        </button>
+                        <button
+                          onClick={() => setShowSMSPreview(false)}
+                          className="px-4 py-2 text-gray-600 text-sm hover:text-gray-800"
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    </div>
+                  )
+                })()}
+              </>
+            )}
+          </div>
+        </Modal>
+      )}
     </div>
   )
 }
@@ -495,6 +749,7 @@ function EntryRow({
   entry,
   onUpdate,
   onFrequencyChange,
+  onPhoneChange,
   isEditing,
   onStartEdit,
   onStopEdit,
@@ -502,6 +757,7 @@ function EntryRow({
   entry: TenantWeekEntry
   onUpdate: (id: string, updates: Partial<TenantWeekEntry>) => void
   onFrequencyChange: (id: string, freq: BillingFrequency) => void
+  onPhoneChange: (id: string, phone: string) => void
   isEditing: boolean
   onStartEdit: () => void
   onStopEdit: () => void
@@ -639,18 +895,38 @@ function EntryRow({
         {!isVacant && entry.amountPaid > 0 && (entry.confirmation || '')}
       </td>
 
-      {/* Check # */}
-      <td className="px-3 py-1.5 text-xs font-mono text-gray-500 text-center">
-        {entry.checkNumber || ''}
+      {/* Check # — editable inline */}
+      <td className="px-3 py-1.5">
+        {!isVacant && !isSpecial && !isPending && (
+          <input
+            type="text"
+            value={entry.checkNumber || ''}
+            onChange={e => onUpdate(tenant.id, { checkNumber: e.target.value })}
+            placeholder="—"
+            className="w-full text-xs font-mono text-center border-0 border-b border-transparent hover:border-gray-200 focus:border-blue-300 bg-transparent px-1 py-0.5 focus:outline-none text-gray-600"
+          />
+        )}
       </td>
 
-      {/* Notes */}
+      {/* Phone */}
       <td className="px-3 py-1.5">
-        <input
-          type="text"
-          value={entry.notes || ''}
-          onChange={e => onUpdate(tenant.id, { notes: e.target.value })}
-          className="w-full text-xs border-0 border-b border-transparent hover:border-gray-200 focus:border-blue-300 bg-transparent px-1 py-0.5 focus:outline-none text-gray-600"
+        {!isVacant && (
+          <input
+            type="tel"
+            value={tenant.phone || ''}
+            onChange={e => onPhoneChange(tenant.id, e.target.value)}
+            placeholder="(555) 123-4567"
+            className="w-full text-xs border-0 border-b border-transparent hover:border-gray-200 focus:border-blue-300 bg-transparent px-1 py-0.5 focus:outline-none text-gray-600"
+          />
+        )}
+      </td>
+
+      {/* Notes — toggle on/off */}
+      <td className="px-3 py-1.5">
+        <NotesCell
+          notes={entry.notes || ''}
+          onChange={(val) => onUpdate(tenant.id, { notes: val })}
+          isVacant={isVacant || false}
         />
       </td>
     </tr>
@@ -685,6 +961,61 @@ function SummaryItem({ label, value, valueColor }: { label: string; value: strin
     <div>
       <div className="text-[10px] text-gray-500 uppercase tracking-wider">{label}</div>
       <div className={cn('text-lg font-bold font-mono', valueColor || 'text-gray-900')}>{value}</div>
+    </div>
+  )
+}
+
+function NotesCell({ notes, onChange, isVacant }: { notes: string; onChange: (val: string) => void; isVacant: boolean }) {
+  const [isOpen, setIsOpen] = useState(false)
+
+  if (isVacant) return null
+
+  // If there are notes, always show them
+  if (notes) {
+    return (
+      <div className="flex items-center gap-1">
+        <input
+          type="text"
+          value={notes}
+          onChange={e => onChange(e.target.value)}
+          className="flex-1 text-xs border-0 border-b border-gray-200 bg-transparent px-1 py-0.5 focus:outline-none focus:border-blue-300 text-gray-600"
+        />
+        <button
+          onClick={() => { onChange(''); setIsOpen(false) }}
+          className="text-gray-300 hover:text-red-400 flex-shrink-0"
+          title="Clear notes"
+        >
+          <X size={12} />
+        </button>
+      </div>
+    )
+  }
+
+  // No notes: show toggle button
+  if (!isOpen) {
+    return (
+      <button
+        onClick={() => setIsOpen(true)}
+        className="text-gray-300 hover:text-gray-500 p-0.5"
+        title="Add note"
+      >
+        <StickyNote size={14} />
+      </button>
+    )
+  }
+
+  // Input expanded
+  return (
+    <div className="flex items-center gap-1">
+      <input
+        type="text"
+        value={notes}
+        onChange={e => onChange(e.target.value)}
+        placeholder="Add note..."
+        autoFocus
+        onBlur={() => { if (!notes) setIsOpen(false) }}
+        className="flex-1 text-xs border-0 border-b border-blue-300 bg-transparent px-1 py-0.5 focus:outline-none text-gray-600"
+      />
     </div>
   )
 }

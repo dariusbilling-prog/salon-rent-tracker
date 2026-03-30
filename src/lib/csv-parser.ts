@@ -1,6 +1,6 @@
 import Papa from 'papaparse'
 import Fuse from 'fuse.js'
-import { Tenant, Payment, PaymentType } from '@/types'
+import { Tenant, PaymentType } from '@/types'
 
 interface CSVRow {
   [key: string]: string
@@ -33,21 +33,16 @@ export interface CSVMatchResult {
 }
 
 // Map TenantCloud column names to our fields
-// Actual TenantCloud headers: Transaction ID, Status, Date created, Due date,
-// Date paid, Type, Transaction category, Currency, Total amount, Paid amount,
-// Left amount, Method of payment, Payer/payee, Payer/payee email, Lease #,
-// Property name, Unit #, Street address, City, State/Region, Zip, Country,
-// Transaction details, Tags
 const COLUMN_MAPPINGS: Record<string, string[]> = {
   tenantName: ['payer/payee', 'tenant name', 'tenant', 'name', 'resident', 'resident name', 'renter'],
   amount: ['paid amount', 'total amount', 'amount', 'payment amount', 'paid', 'total', 'rent paid'],
   paymentDate: ['date paid', 'date created', 'due date', 'date', 'payment date', 'paid date', 'transaction date'],
   dueDate: ['due date', 'due_date'],
-  paymentType: ['method of payment', 'payment method', 'method', 'type', 'payment type'],
+  paymentType: ['method of payment', 'payment method', 'method', 'payment type'],
   status: ['status', 'payment status'],
   suiteNumber: ['unit #', 'unit', 'suite', 'suite number'],
   transactionCategory: ['transaction category', 'category'],
-  type: ['type'],
+  transactionType: ['type'],
 }
 
 function findColumn(headers: string[], field: string): string | null {
@@ -74,20 +69,14 @@ function normalizePaymentType(raw: string): PaymentType {
 }
 
 // Normalize suite numbers for comparison
-// TenantCloud uses "122-2" but we use "122", "129" vs "128/129", etc.
 function normalizeSuite(suite: string): string[] {
   const cleaned = suite.replace(/\s+/g, '').toLowerCase()
-
-  // Generate possible matches
   const variants: string[] = [cleaned]
 
   // "122-2" → also try "122"
   if (cleaned.includes('-')) {
     variants.push(cleaned.split('-')[0])
   }
-
-  // "129" → also try "128/129" format
-  variants.push(cleaned)
 
   return variants
 }
@@ -118,7 +107,19 @@ function findTenantBySuite(suiteFromCSV: string, tenants: Tenant[]): Tenant | nu
   return null
 }
 
+// Check if two dates are in the same month
+function isSameMonth(dateStr1: string, dateStr2: string): boolean {
+  try {
+    const d1 = new Date(dateStr1)
+    const d2 = new Date(dateStr2)
+    return d1.getMonth() === d2.getMonth() && d1.getFullYear() === d2.getFullYear()
+  } catch {
+    return false
+  }
+}
+
 // Extract unique due dates from CSV for the date picker
+// Only includes weekly rent due dates (excludes monthly)
 export function extractDueDates(csvText: string): string[] {
   const parsed = Papa.parse<CSVRow>(csvText, {
     header: true,
@@ -128,15 +129,26 @@ export function extractDueDates(csvText: string): string[] {
 
   const headers = parsed.meta.fields || []
   const dueDateCol = findColumn(headers, 'dueDate')
+  const txnTypeCol = findColumn(headers, 'transactionType')
+  const categoryCol = findColumn(headers, 'transactionCategory')
   if (!dueDateCol) return []
 
   const dates = new Set<string>()
   for (const row of parsed.data) {
     const d = row[dueDateCol]?.trim()
-    if (d && d !== '-') dates.add(d)
+    if (!d || d === '-') continue
+
+    // Only include weekly rent due dates in the picker (not monthly or one-time)
+    const txnType = txnTypeCol ? row[txnTypeCol]?.trim().toLowerCase() || '' : ''
+    const category = categoryCol ? row[categoryCol]?.trim().toLowerCase() || '' : ''
+
+    // Skip non-rent, monthly, and one-time entries in the date picker
+    if (category && !category.includes('rent')) continue
+    if (txnType.includes('monthly') || txnType.includes('one time')) continue
+
+    dates.add(d)
   }
 
-  // Sort dates chronologically
   return Array.from(dates).sort((a, b) => new Date(a).getTime() - new Date(b).getTime())
 }
 
@@ -161,12 +173,12 @@ export function parseAndMatchCSV(
   // Auto-detect columns
   const nameCol = columnMap?.tenantName || findColumn(headers, 'tenantName')
   const amountCol = columnMap?.amount || findColumn(headers, 'amount')
-  const dateCol = columnMap?.paymentDate || findColumn(headers, 'paymentDate')
   const dueDateCol = columnMap?.dueDate || findColumn(headers, 'dueDate')
   const typeCol = columnMap?.paymentType || findColumn(headers, 'paymentType')
   const statusCol = columnMap?.status || findColumn(headers, 'status')
   const suiteCol = columnMap?.suiteNumber || findColumn(headers, 'suiteNumber')
   const categoryCol = findColumn(headers, 'transactionCategory')
+  const txnTypeCol = findColumn(headers, 'transactionType')
 
   if (!nameCol || !amountCol) {
     throw new Error(`Could not find required columns. Found headers: ${headers.join(', ')}. Need at least tenant name and amount.`)
@@ -203,11 +215,20 @@ export function parseAndMatchCSV(
     const rawDueDate = dueDateCol ? row[dueDateCol]?.trim() : ''
     const rawSuite = suiteCol ? row[suiteCol]?.trim() : ''
     const rawCategory = categoryCol ? row[categoryCol]?.trim() : ''
+    const rawTxnType = txnTypeCol ? row[txnTypeCol]?.trim() : ''
+
+    // Check if this is a monthly recurring transaction
+    const isMonthlyTxn = rawTxnType.toLowerCase().includes('monthly')
 
     // Filter by selected due date if provided
+    // BUT: include monthly transactions if they're in the same month
     if (selectedDueDate && rawDueDate && rawDueDate !== selectedDueDate) {
-      result.skipped.push({ csvRow: row, reason: `Different due date: ${rawDueDate}` })
-      continue
+      if (isMonthlyTxn && isSameMonth(rawDueDate, selectedDueDate)) {
+        // Monthly payment in the same month — include it
+      } else {
+        result.skipped.push({ csvRow: row, reason: `Different due date: ${rawDueDate}` })
+        continue
+      }
     }
 
     if (!rawName || !rawAmount) {
@@ -215,25 +236,32 @@ export function parseAndMatchCSV(
       continue
     }
 
-    // Skip non-rent transactions (like late fees)
+    // Skip non-rent transactions (like late fees, software expenses)
     if (rawCategory && !rawCategory.toLowerCase().includes('rent')) {
       result.skipped.push({ csvRow: row, reason: `Not rent: ${rawCategory}` })
       continue
     }
 
-    // Skip overdue/unpaid entries
-    if (rawStatus && ['overdue'].some(s => rawStatus.toLowerCase().includes(s))) {
+    // Skip voided transactions
+    if (rawStatus && rawStatus.toLowerCase() === 'void') {
+      result.skipped.push({ csvRow: row, reason: `Voided transaction` })
+      continue
+    }
+
+    // Skip overdue/unpaid entries (no payment made)
+    if (rawStatus && rawStatus.toLowerCase() === 'overdue') {
       result.skipped.push({ csvRow: row, reason: `Status: ${rawStatus}` })
       continue
     }
 
-    // Skip if status indicates not completed
-    if (rawStatus && !['paid', 'completed', 'processed', 'success', 'partial'].some(s => rawStatus.toLowerCase().includes(s))) {
-      if (['pending', 'failed', 'cancelled', 'refunded'].some(s => rawStatus.toLowerCase().includes(s))) {
-        result.skipped.push({ csvRow: row, reason: `Status: ${rawStatus}` })
-        continue
-      }
+    // Skip failed/cancelled/refunded
+    if (rawStatus && ['failed', 'cancelled', 'refunded'].some(s => rawStatus.toLowerCase().includes(s))) {
+      result.skipped.push({ csvRow: row, reason: `Status: ${rawStatus}` })
+      continue
     }
+
+    // Include: Paid, Completed, Processed, Partial, Pending (with amount)
+    // Pending in TenantCloud often means payment is processing but will go through
 
     const amount = parseFloat(rawAmount.replace(/[$,]/g, ''))
     if (isNaN(amount) || amount <= 0) {

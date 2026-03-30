@@ -67,7 +67,8 @@ export function getCurrentRentWeek(): { weekStart: string; weekEnd: string; dueD
 
   const fmt = (d: Date) => d.toISOString().split('T')[0]
 
-  const weekLabel = `${monday.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} – ${friday.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })}`
+  // Show the Friday due date as the week label (e.g. "Friday 3/20/26")
+  const weekLabel = `Friday ${friday.getMonth() + 1}/${friday.getDate()}/${friday.getFullYear().toString().slice(-2)}`
 
   return {
     weekStart: fmt(monday),

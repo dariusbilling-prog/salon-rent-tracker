@@ -1,6 +1,6 @@
 import jsPDF from 'jspdf'
 import autoTable from 'jspdf-autotable'
-import { TenantWeekEntry, WeekStatus } from '@/types'
+import { TenantWeekEntry } from '@/types'
 import { formatCurrency, getStatusLabel } from './utils'
 
 interface ReportData {
@@ -113,15 +113,7 @@ export function generateWeeklyPDF(data: ReportData): jsPDF {
         }
       }
     },
-    foot: [[
-      '', 'TOTALS:', formatCurrency(data.totalDue), formatCurrency(data.totalPaid), '', '', '', '', ''
-    ]],
-    footStyles: {
-      fillColor: [243, 244, 246],
-      textColor: [17, 24, 39],
-      fontStyle: 'bold',
-      fontSize: 9,
-    },
+    // No foot — summary is at the top to avoid duplicate totals
   })
 
   // Footer
