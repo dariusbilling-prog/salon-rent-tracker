@@ -96,57 +96,95 @@ function toISODate(date: Date): string {
 }
 
 // Parse a Chase Zelle notification email body/subject to extract payment details
-// Chase email formats we handle:
+// Handles BOTH direct Chase emails AND forwarded Chase emails from accountant
+// Chase email formats:
 //   Subject: "You received $XXX from NAME with Zelle®"
 //   Subject: "NAME sent you $XXX.XX with Zelle®"
-//   Body often contains: "FirstName LastName sent you $XXX.XX" or similar
+//   Subject: "Fwd: You received money with Zelle®"  (forwarded — details in body)
+//   Body: "FirstName LastName sent you $XXX.XX" or similar
+//   Body (forwarded): Contains original Chase notification with sender/amount
 export function parseChaseZelleEmail(subject: string, body: string): {
   senderName: string | null
   amount: number | null
   memo?: string
+  originalDate?: string // ISO date extracted from forwarded email content
 } {
   const cleanBody = stripHtml(body)
-  const combined = `${subject} ${cleanBody}`
+  // Strip "Fwd:" or "Fwd: " prefix from subject for cleaner matching
+  const cleanSubject = subject.replace(/^Fwd:\s*/i, '').trim()
+  const combined = `${cleanSubject} ${cleanBody}`
 
   // Try to extract amount — look for $XXX or $XXX.XX
-  // Prefer amounts in the subject or near "sent you" / "received"
   let amount: number | null = null
   const amountPatterns = [
+    // "sent you $250.00" or "received $250.00"
     /(?:received|sent you|you received)\s*\$([\d,]+(?:\.\d{2})?)/i,
+    // "$250.00 from NAME" or "$250.00 with Zelle"
     /\$([\d,]+(?:\.\d{2})?)\s*(?:from|has been|with Zelle)/i,
+    // Any dollar amount with cents
     /\$([\d,]+\.\d{2})/,
+    // Any dollar amount
     /\$([\d,]+)/,
   ]
   for (const pattern of amountPatterns) {
     const match = combined.match(pattern)
     if (match) {
       amount = parseFloat(match[1].replace(/,/g, ''))
-      if (!isNaN(amount)) break
+      if (!isNaN(amount) && amount > 0) break
       amount = null
     }
   }
 
-  // Try to extract sender name from subject first (most reliable)
+  // Try to extract sender name — check both subject and body
   let senderName: string | null = null
   const namePatterns = [
-    // "NAME sent you $XXX with Zelle" (subject)
-    /^(.+?)\s+sent you\s+\$[\d.,]+(?:\s+with Zelle)?/i,
+    // "NAME sent you $XXX with Zelle"
+    /(.+?)\s+sent you\s+\$[\d.,]+/i,
     // "You received $XXX from NAME with Zelle"
-    /You received\s+\$[\d.,]+\s+from\s+(.+?)(?:\s+with Zelle|$)/i,
-    // "received from NAME"
-    /received (?:a payment )?from\s+(.+?)(?:\s+for|\.|\s+with|\s+on|$)/i,
+    /You received\s+\$[\d.,]+\s+from\s+(.+?)(?:\s+with Zelle|\s*\.|\s*$)/i,
+    // "received money from NAME"
+    /received (?:money |a payment )?from\s+(.+?)(?:\s+for|\s*\.|\s+with|\s+on|\s*$)/i,
     // "NAME has sent you"
-    /^(.+?)\s+has sent you/i,
+    /(.+?)\s+has sent you/i,
+    // Just "from NAME" near Zelle context
+    /from\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)(?:\s|\.|\,|$)/,
   ]
+
+  // Try subject first (most reliable), then body
   for (const pattern of namePatterns) {
-    const match = subject.match(pattern) || cleanBody.match(pattern)
+    const match = cleanSubject.match(pattern) || cleanBody.match(pattern)
     if (match) {
-      senderName = match[1].trim()
-      // Clean trailing punctuation and common noise
-      senderName = senderName.replace(/[.,;:!?]+$/, '').trim()
-      // If it's too long it's probably a phrase, not a name
-      if (senderName.length > 0 && senderName.length < 80) break
-      senderName = null
+      let name = match[1].trim()
+      // Clean trailing punctuation, "Fwd:", and common noise
+      name = name.replace(/^(?:Fwd|Re|FW):\s*/i, '').trim()
+      name = name.replace(/[.,;:!?]+$/, '').trim()
+      // Skip if too long (probably a phrase) or too short
+      if (name.length > 1 && name.length < 80 && !name.toLowerCase().includes('zelle')) {
+        senderName = name
+        break
+      }
+    }
+  }
+
+  // Try to extract original date from forwarded email content
+  // Look for patterns like "Date: April 10, 2026" or "April 10, 2026 at 3:45 PM"
+  let originalDate: string | undefined
+  const datePatterns = [
+    /Date:\s*([A-Z][a-z]+\s+\d{1,2},?\s+\d{4})/i,
+    /(?:on|dated?)\s+([A-Z][a-z]+\s+\d{1,2},?\s+\d{4})/i,
+    /(\d{1,2}\/\d{1,2}\/\d{4})/,
+    /([A-Z][a-z]+\s+\d{1,2},?\s+\d{4})\s+at\s+\d/i,
+  ]
+  for (const pattern of datePatterns) {
+    const match = cleanBody.match(pattern)
+    if (match) {
+      try {
+        const parsed = new Date(match[1])
+        if (!isNaN(parsed.getTime())) {
+          originalDate = toISODate(parsed)
+          break
+        }
+      } catch { /* ignore parse failures */ }
     }
   }
 
@@ -165,7 +203,7 @@ export function parseChaseZelleEmail(subject: string, body: string): {
     }
   }
 
-  return { senderName, amount, memo }
+  return { senderName, amount, memo, originalDate }
 }
 
 // Fetch Chase Zelle emails from Gmail in a given date range
@@ -180,8 +218,9 @@ export async function fetchZelleEmails(
   beforeEnd.setDate(beforeEnd.getDate() + 1) // include the end date
   const beforeStr = `${beforeEnd.getFullYear()}/${beforeEnd.getMonth() + 1}/${beforeEnd.getDate()}`
 
-  // Broad query that catches various Chase Zelle notification formats
-  const query = `from:(chase.com OR jpmorgan.com OR no.reply.alerts@chase.com) (Zelle OR "sent you" OR "received") after:${afterStr} before:${beforeStr}`
+  // Broad query: catches direct Chase emails AND forwarded Zelle notifications
+  // User's accountant forwards Chase Zelle emails, so we can't filter by from:chase.com alone
+  const query = `(Zelle "received money" OR "sent you" OR "You received") after:${afterStr} before:${beforeStr}`
 
   // Step 1: list messages matching the query
   const listUrl = `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent(query)}&maxResults=100`
@@ -215,28 +254,32 @@ export async function fetchZelleEmails(
       const subject = headers.find((h: any) => h.name === 'Subject')?.value || ''
       const dateHeader = headers.find((h: any) => h.name === 'Date')?.value || ''
 
-      // Only include if subject clearly relates to receiving Zelle
-      // (exclude emails about sending Zelle, declined, etc.)
+      const body = extractBody(msg.payload)
+
+      // Include if subject or body relates to receiving Zelle — handle forwarded emails too
+      // Forwarded subjects look like: "Fwd: You received money with Zelle®"
       const subjectLower = subject.toLowerCase()
+      const bodyLower = body.toLowerCase()
+      const combined = `${subjectLower} ${bodyLower}`
       const isReceivedZelle =
-        subjectLower.includes('zelle') &&
-        (subjectLower.includes('received') ||
-          subjectLower.includes('sent you') ||
-          subjectLower.includes('deposited'))
+        combined.includes('zelle') &&
+        (combined.includes('received') ||
+          combined.includes('sent you') ||
+          combined.includes('deposited'))
 
       if (!isReceivedZelle) continue
-
-      const body = extractBody(msg.payload)
       const parsed = parseChaseZelleEmail(subject, body)
 
       if (!parsed.senderName || !parsed.amount) continue
 
       const dateObj = dateHeader ? new Date(dateHeader) : new Date()
+      // For forwarded emails, prefer the original Chase email date over the forwarded date
+      const effectiveDate = parsed.originalDate || toISODate(dateObj)
 
       payments.push({
         senderName: parsed.senderName,
         amount: parsed.amount,
-        dateReceived: toISODate(dateObj),
+        dateReceived: effectiveDate,
         memo: parsed.memo,
         messageId: id,
         subject,
