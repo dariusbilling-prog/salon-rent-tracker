@@ -139,10 +139,16 @@ export default function RentTracker() {
           setZelleError('Gmail is not connected. Click "Connect Gmail" first.')
           setGmailConnected(false)
         } else {
-          setZelleError(data.error || 'Failed to scan Gmail')
+          const debugStr = data.debug ? `\n\nDebug: ${JSON.stringify(data.debug)}` : ''
+          setZelleError((data.error || 'Failed to scan Gmail') + debugStr)
         }
         setZelleLoading(false)
         return
+      }
+
+      // Show debug info if 0 results
+      if (data.payments?.length === 0 && data.debug) {
+        setZelleError(`Debug info: ${JSON.stringify(data.debug)}`)
       }
 
       // Match senders to tenants

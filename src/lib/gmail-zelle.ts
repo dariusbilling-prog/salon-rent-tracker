@@ -210,7 +210,7 @@ export function parseChaseZelleEmail(subject: string, body: string): {
 export async function fetchZelleEmails(
   accessToken: string,
   startDate: Date,
-  endDate: Date
+  endDate: Date,
 ): Promise<ParsedZellePayment[]> {
   // Gmail search query: Chase Zelle emails between the dates
   const afterStr = `${startDate.getFullYear()}/${startDate.getMonth() + 1}/${startDate.getDate()}`
@@ -222,8 +222,6 @@ export async function fetchZelleEmails(
   // We filter more precisely in code after fetching each message
   const query = `Zelle after:${afterStr} before:${beforeStr}`
 
-  console.log('[Zelle Scan] Gmail query:', query)
-
   // Step 1: list messages matching the query
   const listUrl = `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent(query)}&maxResults=100`
   const listResponse = await fetch(listUrl, {
@@ -232,16 +230,19 @@ export async function fetchZelleEmails(
 
   if (!listResponse.ok) {
     const errorBody = await listResponse.text()
-    throw new Error(`Gmail list failed: ${listResponse.status} ${errorBody}`)
+    throw new Error(`Gmail list failed (${listResponse.status}): ${errorBody.slice(0, 500)}`)
   }
 
   const listData = await listResponse.json()
   const messageIds: string[] = (listData.messages || []).map((m: any) => m.id)
 
+  console.log(`[Zelle] Query: "${query}" → ${messageIds.length} messages found`)
+
   if (messageIds.length === 0) return []
 
   // Step 2: fetch each message and parse
   const payments: ParsedZellePayment[] = []
+  const skipped: Array<{ id: string; subject: string; reason: string }> = []
 
   for (const id of messageIds) {
     try {
@@ -249,7 +250,10 @@ export async function fetchZelleEmails(
         `https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=full`,
         { headers: { Authorization: `Bearer ${accessToken}` } }
       )
-      if (!msgResponse.ok) continue
+      if (!msgResponse.ok) {
+        skipped.push({ id, subject: '(fetch failed)', reason: `HTTP ${msgResponse.status}` })
+        continue
+      }
 
       const msg = await msgResponse.json()
       const headers = msg.payload?.headers || []
@@ -269,10 +273,17 @@ export async function fetchZelleEmails(
           combined.includes('sent you') ||
           combined.includes('deposited'))
 
-      if (!isReceivedZelle) continue
+      if (!isReceivedZelle) {
+        skipped.push({ id, subject, reason: 'not a received Zelle email' })
+        continue
+      }
+
       const parsed = parseChaseZelleEmail(subject, body)
 
-      if (!parsed.senderName || !parsed.amount) continue
+      if (!parsed.senderName || !parsed.amount) {
+        skipped.push({ id, subject, reason: `parse failed: name=${parsed.senderName}, amount=${parsed.amount}` })
+        continue
+      }
 
       const dateObj = dateHeader ? new Date(dateHeader) : new Date()
       // For forwarded emails, prefer the original Chase email date over the forwarded date
@@ -288,8 +299,13 @@ export async function fetchZelleEmails(
         raw: msg.snippet,
       })
     } catch (err) {
-      console.error(`Failed to fetch/parse message ${id}:`, err)
+      skipped.push({ id, subject: '(error)', reason: (err as Error).message })
     }
+  }
+
+  console.log(`[Zelle] Parsed ${payments.length} payments, skipped ${skipped.length}`)
+  if (skipped.length > 0) {
+    console.log(`[Zelle] Skipped:`, JSON.stringify(skipped.slice(0, 5)))
   }
 
   return payments
