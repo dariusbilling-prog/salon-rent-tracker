@@ -183,7 +183,24 @@ export default function RentTracker() {
 
   const currentWeekEntries: MonthTenantEntry[] = useMemo(() => {
     if (activeTab === 'monthly-summary' || !activeTab) return []
-    return monthData.weeks[activeTab] || []
+    const entries = monthData.weeks[activeTab] || []
+
+    // Auto-mark unpaid entries as "late" if the current date is past the week's Friday
+    const today = new Date()
+    today.setHours(0, 0, 0, 0)
+    const [y, m, d] = activeTab.split('-').map(Number)
+    const friday = new Date(y, m - 1, d)
+    friday.setHours(0, 0, 0, 0)
+
+    if (today > friday) {
+      return entries.map(e => {
+        if (e.status === 'unpaid' && !e.isVacant) {
+          return { ...e, status: 'late' as WeekStatus }
+        }
+        return e
+      })
+    }
+    return entries
   }, [monthData, activeTab])
 
   // Update a single entry in the active week
