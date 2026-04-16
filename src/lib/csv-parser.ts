@@ -6,17 +6,21 @@ interface CSVRow {
   [key: string]: string
 }
 
+export interface CSVMatch {
+  csvRow: CSVRow
+  tenant: Tenant
+  amount: number
+  paymentType: PaymentType
+  confidence: number
+  matchMethod: 'suite' | 'exact' | 'fuzzy'
+  csvName: string
+  csvUnit: string
+  dueDate: string // ISO format YYYY-MM-DD (the Friday this belongs to)
+  isMonthlyPayment: boolean // true if this is a monthly recurring payment
+}
+
 export interface CSVMatchResult {
-  matched: Array<{
-    csvRow: CSVRow
-    tenant: Tenant
-    amount: number
-    paymentType: PaymentType
-    confidence: number
-    matchMethod: 'suite' | 'exact' | 'fuzzy'
-    csvName: string
-    csvUnit: string
-  }>
+  matched: CSVMatch[]
   unmatched: Array<{
     csvRow: CSVRow
     amount: number
@@ -29,7 +33,28 @@ export interface CSVMatchResult {
     csvRow: CSVRow
     reason: string
   }>
-  availableDueDates: string[]
+  availableDueDates: string[] // ISO YYYY-MM-DD Fridays found in the CSV
+  monthsDetected: string[] // YYYY-MM format
+}
+
+// Convert a date string to ISO YYYY-MM-DD
+function toISODate(dateStr: string): string {
+  try {
+    const d = new Date(dateStr)
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+  } catch {
+    return dateStr
+  }
+}
+
+// Convert a date string to YYYY-MM month key
+function toMonthKey(dateStr: string): string {
+  try {
+    const d = new Date(dateStr)
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
+  } catch {
+    return dateStr
+  }
 }
 
 // Map TenantCloud column names to our fields
@@ -107,17 +132,6 @@ function findTenantBySuite(suiteFromCSV: string, tenants: Tenant[]): Tenant | nu
   return null
 }
 
-// Check if two dates are in the same month
-function isSameMonth(dateStr1: string, dateStr2: string): boolean {
-  try {
-    const d1 = new Date(dateStr1)
-    const d2 = new Date(dateStr2)
-    return d1.getMonth() === d2.getMonth() && d1.getFullYear() === d2.getFullYear()
-  } catch {
-    return false
-  }
-}
-
 // Extract unique due dates from CSV for the date picker
 // Only includes weekly rent due dates (excludes monthly)
 export function extractDueDates(csvText: string): string[] {
@@ -155,7 +169,6 @@ export function extractDueDates(csvText: string): string[] {
 export function parseAndMatchCSV(
   csvText: string,
   tenants: Tenant[],
-  selectedDueDate?: string,
   columnMap?: Record<string, string>
 ): CSVMatchResult {
   const parsed = Papa.parse<CSVRow>(csvText, {
@@ -184,8 +197,9 @@ export function parseAndMatchCSV(
     throw new Error(`Could not find required columns. Found headers: ${headers.join(', ')}. Need at least tenant name and amount.`)
   }
 
-  // Get all available due dates
-  const availableDueDates = dueDateCol ? extractDueDates(csvText) : []
+  // Get all available weekly due dates and months
+  const availableDueDates = dueDateCol ? extractDueDates(csvText).map(toISODate) : []
+  const monthsDetected = Array.from(new Set(availableDueDates.map(toMonthKey))).sort()
 
   // Set up fuzzy matching as fallback
   const activeTenants = tenants.filter(t => t.isActive)
@@ -195,9 +209,9 @@ export function parseAndMatchCSV(
     includeScore: true,
   })
 
-  const result: CSVMatchResult = { matched: [], unmatched: [], skipped: [], availableDueDates }
+  const result: CSVMatchResult = { matched: [], unmatched: [], skipped: [], availableDueDates, monthsDetected }
 
-  // Track amounts per suite for combining split payments (like Suite 135)
+  // Track amounts per (suite + dueDate) to combine split payments per week
   type SuitePaymentData = {
     tenant: Tenant
     totalAmount: number
@@ -205,6 +219,8 @@ export function parseAndMatchCSV(
     rows: CSVRow[]
     names: string[]
     matchMethod: 'suite' | 'exact' | 'fuzzy'
+    dueDate: string // ISO format
+    isMonthlyPayment: boolean
   }
   const suitePayments = new Map<string, SuitePaymentData>()
 
@@ -219,17 +235,6 @@ export function parseAndMatchCSV(
 
     // Check if this is a monthly recurring transaction
     const isMonthlyTxn = rawTxnType.toLowerCase().includes('monthly')
-
-    // Filter by selected due date if provided
-    // BUT: include monthly transactions if they're in the same month
-    if (selectedDueDate && rawDueDate && rawDueDate !== selectedDueDate) {
-      if (isMonthlyTxn && isSameMonth(rawDueDate, selectedDueDate)) {
-        // Monthly payment in the same month — include it
-      } else {
-        result.skipped.push({ csvRow: row, reason: `Different due date: ${rawDueDate}` })
-        continue
-      }
-    }
 
     if (!rawName || !rawAmount) {
       result.skipped.push({ csvRow: row, reason: 'Missing name or amount' })
@@ -270,6 +275,31 @@ export function parseAndMatchCSV(
     }
 
     const paymentType = typeCol ? normalizePaymentType(row[typeCol] || '') : 'ACH'
+    const isoDate = toISODate(rawDueDate)
+
+    // Helper to add/combine a match entry (keyed by tenant + dueDate)
+    const addMatch = (tenant: Tenant, matchMethod: 'suite' | 'exact' | 'fuzzy') => {
+      const key = `${tenant.id}:${isoDate}`
+      if (suitePayments.has(key)) {
+        const existing = suitePayments.get(key)!
+        existing.totalAmount += amount
+        existing.rows.push(row)
+        if (!existing.names.includes(rawName)) {
+          existing.names.push(rawName)
+        }
+      } else {
+        suitePayments.set(key, {
+          tenant,
+          totalAmount: amount,
+          paymentType,
+          rows: [row],
+          names: [rawName],
+          matchMethod,
+          dueDate: isoDate,
+          isMonthlyPayment: isMonthlyTxn,
+        })
+      }
+    }
 
     // === MATCHING WATERFALL ===
 
@@ -277,25 +307,7 @@ export function parseAndMatchCSV(
     if (rawSuite) {
       const suiteMatch = findTenantBySuite(rawSuite, activeTenants)
       if (suiteMatch) {
-        // Combine payments for the same suite (handles Suite 135 split payments)
-        const key = suiteMatch.id
-        if (suitePayments.has(key)) {
-          const existing = suitePayments.get(key)!
-          existing.totalAmount += amount
-          existing.rows.push(row)
-          if (!existing.names.includes(rawName)) {
-            existing.names.push(rawName)
-          }
-        } else {
-          suitePayments.set(key, {
-            tenant: suiteMatch,
-            totalAmount: amount,
-            paymentType,
-            rows: [row],
-            names: [rawName],
-            matchMethod: 'suite',
-          })
-        }
+        addMatch(suiteMatch, 'suite')
         continue
       }
     }
@@ -308,21 +320,7 @@ export function parseAndMatchCSV(
     )
 
     if (exactMatch) {
-      const key = exactMatch.id
-      if (suitePayments.has(key)) {
-        const existing = suitePayments.get(key)!
-        existing.totalAmount += amount
-        existing.rows.push(row)
-      } else {
-        suitePayments.set(key, {
-          tenant: exactMatch,
-          totalAmount: amount,
-          paymentType,
-          rows: [row],
-          names: [rawName],
-          matchMethod: 'exact',
-        })
-      }
+      addMatch(exactMatch, 'exact')
       continue
     }
 
@@ -333,21 +331,7 @@ export function parseAndMatchCSV(
       const confidence = 1 - (bestMatch.score || 0)
 
       if (confidence >= 0.7) {
-        const key = bestMatch.item.id
-        if (suitePayments.has(key)) {
-          const existing = suitePayments.get(key)!
-          existing.totalAmount += amount
-          existing.rows.push(row)
-        } else {
-          suitePayments.set(key, {
-            tenant: bestMatch.item,
-            totalAmount: amount,
-            paymentType,
-            rows: [row],
-            names: [rawName],
-            matchMethod: 'fuzzy',
-          })
-        }
+        addMatch(bestMatch.item, 'fuzzy')
       } else {
         result.unmatched.push({
           csvRow: row,
@@ -371,19 +355,24 @@ export function parseAndMatchCSV(
   // Convert combined suite payments into matched results
   Array.from(suitePayments.values()).forEach((data) => {
     result.matched.push({
-      csvRow: data.rows[0], // primary row
+      csvRow: data.rows[0],
       tenant: data.tenant,
-      amount: Math.round(data.totalAmount * 100) / 100, // fix floating point
+      amount: Math.round(data.totalAmount * 100) / 100,
       paymentType: data.paymentType,
       confidence: 1.0,
       matchMethod: data.matchMethod,
       csvName: data.names.join(', '),
       csvUnit: data.rows[0]?.[findColumn(parsed.meta.fields || [], 'suiteNumber') || ''] || '',
+      dueDate: data.dueDate,
+      isMonthlyPayment: data.isMonthlyPayment,
     })
   })
 
   return result
 }
+
+// Remove old isSameMonth helper if no longer needed elsewhere
+export { toISODate, toMonthKey }
 
 // Returns CSV headers for the column mapping UI
 export function getCSVHeaders(csvText: string): string[] {

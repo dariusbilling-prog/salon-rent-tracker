@@ -51,6 +51,63 @@ export function getStatusColor(status: WeekStatus): string {
   return colors[status]
 }
 
+// Format a date as ISO YYYY-MM-DD
+export function toISODate(date: Date): string {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
+}
+
+// Parse ISO YYYY-MM-DD to a Date (local timezone)
+export function fromISODate(iso: string): Date {
+  const [year, month, day] = iso.split('-').map(Number)
+  return new Date(year, month - 1, day)
+}
+
+// Get all Fridays in a given month (YYYY-MM)
+export function getFridaysInMonth(monthKey: string): string[] {
+  const [year, month] = monthKey.split('-').map(Number)
+  const fridays: string[] = []
+  const date = new Date(year, month - 1, 1)
+  while (date.getMonth() === month - 1) {
+    if (date.getDay() === 5) {
+      fridays.push(toISODate(date))
+    }
+    date.setDate(date.getDate() + 1)
+  }
+  return fridays
+}
+
+// Format a Friday ISO date to short label (e.g. "3/20")
+export function fridayShortLabel(iso: string): string {
+  const d = fromISODate(iso)
+  return `${d.getMonth() + 1}/${d.getDate()}`
+}
+
+// Format a Friday ISO date to full label (e.g. "Friday 3/20/26")
+export function fridayFullLabel(iso: string): string {
+  const d = fromISODate(iso)
+  return `Friday ${d.getMonth() + 1}/${d.getDate()}/${d.getFullYear().toString().slice(-2)}`
+}
+
+// Format a month key YYYY-MM to label (e.g. "March 2026")
+export function monthLabel(monthKey: string): string {
+  const [year, month] = monthKey.split('-').map(Number)
+  const d = new Date(year, month - 1, 1)
+  return d.toLocaleDateString('en-US', { month: 'long', year: 'numeric' })
+}
+
+// Get current month key YYYY-MM
+export function getCurrentMonthKey(): string {
+  const d = new Date()
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
+}
+
+// Navigate months
+export function addMonths(monthKey: string, offset: number): string {
+  const [year, month] = monthKey.split('-').map(Number)
+  const d = new Date(year, month - 1 + offset, 1)
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
+}
+
 // Get the current rent week (Monday to Friday containing today)
 export function getCurrentRentWeek(): { weekStart: string; weekEnd: string; dueDate: string; weekLabel: string } {
   const today = new Date()
