@@ -26,11 +26,20 @@ export interface MonthData {
 export function createEmptyMonth(monthKey: string, tenants: Tenant[]): MonthData {
   const fridays = getFridaysInMonth(monthKey)
   const weeks: Record<string, MonthTenantEntry[]> = {}
+  const today = new Date()
+  today.setHours(0, 0, 0, 0)
 
   for (const friday of fridays) {
+    const [fy, fm, fd] = friday.split('-').map(Number)
+    const fridayDate = new Date(fy, fm - 1, fd)
+    fridayDate.setHours(0, 0, 0, 0)
+    const isPastDue = today > fridayDate
+
     weeks[friday] = generateWeekEntries(tenants).map(e => ({
       ...e,
-      paymentSource: 'none',
+      paymentSource: 'none' as PaymentSource,
+      // Auto-mark as late if the Friday has already passed
+      status: (isPastDue && e.status === 'unpaid' && !e.isVacant) ? 'late' : e.status,
     }))
   }
 
@@ -79,9 +88,18 @@ export function mergeCSVIntoMonth(
   }
 
   // Apply matches to each Friday's entries (smart merge)
+  const today = new Date()
+  today.setHours(0, 0, 0, 0)
+
   for (const friday of fridays) {
     const entries = weeks[friday]
     const weekMatches = matchesByFriday[friday]
+
+    // Check if this Friday has already passed
+    const [fy, fm, fd] = friday.split('-').map(Number)
+    const fridayDate = new Date(fy, fm - 1, fd)
+    fridayDate.setHours(0, 0, 0, 0)
+    const isPastDue = today > fridayDate
 
     for (const match of weekMatches) {
       const idx = entries.findIndex(e => e.tenant.id === match.tenant.id)
@@ -105,6 +123,15 @@ export function mergeCSVIntoMonth(
         confirmation:
           match.paymentType === 'ACH' || match.paymentType === 'Card' ? 'Card Processed' : undefined,
         paymentSource: 'csv',
+      }
+    }
+
+    // After applying CSV matches, mark remaining unpaid entries as 'late' if past due
+    if (isPastDue) {
+      for (let i = 0; i < entries.length; i++) {
+        if (entries[i].status === 'unpaid' && !entries[i].isVacant) {
+          entries[i] = { ...entries[i], status: 'late' }
+        }
       }
     }
   }

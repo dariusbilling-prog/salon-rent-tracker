@@ -218,9 +218,11 @@ export async function fetchZelleEmails(
   beforeEnd.setDate(beforeEnd.getDate() + 1) // include the end date
   const beforeStr = `${beforeEnd.getFullYear()}/${beforeEnd.getMonth() + 1}/${beforeEnd.getDate()}`
 
-  // Broad query: catches direct Chase emails AND forwarded Zelle notifications
-  // User's accountant forwards Chase Zelle emails, so we can't filter by from:chase.com alone
-  const query = `(Zelle "received money" OR "sent you" OR "You received") after:${afterStr} before:${beforeStr}`
+  // Simple broad query: just find anything with "Zelle" in the date range
+  // We filter more precisely in code after fetching each message
+  const query = `Zelle after:${afterStr} before:${beforeStr}`
+
+  console.log('[Zelle Scan] Gmail query:', query)
 
   // Step 1: list messages matching the query
   const listUrl = `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent(query)}&maxResults=100`

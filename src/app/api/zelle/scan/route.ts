@@ -31,9 +31,13 @@ export async function POST(request: NextRequest) {
 
     let payments: ParsedZellePayment[] = []
 
+    console.log('[Zelle Scan] Date range:', body.startDate, 'to', body.endDate)
+    console.log('[Zelle Scan] Has access token:', !!accessToken)
+
     try {
       payments = await fetchZelleEmails(accessToken, startDate, endDate)
     } catch (err) {
+      console.log('[Zelle Scan] Error:', (err as Error).message)
       // If the token expired mid-request, try refreshing and retry
       if (refreshToken && (err as Error).message.includes('401')) {
         const newToken = await refreshAccessToken(refreshToken)
@@ -42,6 +46,7 @@ export async function POST(request: NextRequest) {
           // Update cookie with new access token
           const response = NextResponse.json({
             payments: payments.map(p => ({ ...p, assignedFriday: getFridayForDate(p.dateReceived) })),
+            debug: { dateRange: `${body.startDate} to ${body.endDate}`, totalFound: payments.length }
           })
           response.cookies.set('gmail_access_token', newToken, {
             httpOnly: true,
@@ -56,13 +61,21 @@ export async function POST(request: NextRequest) {
       throw err
     }
 
+    console.log('[Zelle Scan] Found', payments.length, 'payments')
+    if (payments.length > 0) {
+      console.log('[Zelle Scan] First payment:', JSON.stringify(payments[0]))
+    }
+
     // Tag each payment with the Friday week it belongs to
     const withFridays = payments.map(p => ({
       ...p,
       assignedFriday: getFridayForDate(p.dateReceived),
     }))
 
-    return NextResponse.json({ payments: withFridays })
+    return NextResponse.json({
+      payments: withFridays,
+      debug: { dateRange: `${body.startDate} to ${body.endDate}`, totalFound: payments.length }
+    })
   } catch (err) {
     return NextResponse.json(
       { error: 'Failed to scan Gmail: ' + (err as Error).message },
