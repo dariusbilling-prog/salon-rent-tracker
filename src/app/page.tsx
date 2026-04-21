@@ -5,7 +5,7 @@ import {
   Upload, Plus, FileDown, ChevronLeft, ChevronRight,
   Check, AlertCircle, Clock, Gift, Heart, Calendar, Repeat,
   MessageSquare, Phone, Send, Loader2, StickyNote, X, BarChart3,
-  TrendingUp, CreditCard, RefreshCw, Mail, CheckCircle2
+  TrendingUp, CreditCard, RefreshCw, Mail, CheckCircle2, Camera, Image
 } from 'lucide-react'
 import { TenantWeekEntry, WeekStatus, PaymentType, BillingFrequency } from '@/types'
 import { TENANTS } from '@/lib/tenant-data'
@@ -22,6 +22,7 @@ import {
   saveMonthData, loadMonthData, calculateMonthlySummary,
   matchZellePayments, applyZelleMatchesToMonth, ZelleMatch
 } from '@/lib/month-data'
+import { CheckScanResult } from '@/lib/check-scanner'
 
 const WEEK_STATUSES: WeekStatus[] = ['paid', 'partial', 'late', 'unpaid', 'free_week', 'comped_week']
 const PAYMENT_TYPES: PaymentType[] = ['ACH', 'Zelle', 'Check', 'Cash', 'Money Order', 'Card']
@@ -54,7 +55,16 @@ export default function RentTracker() {
   const [zelleMatches, setZelleMatches] = useState<ZelleMatch[] | null>(null)
   const [zelleError, setZelleError] = useState<string | null>(null)
 
+  // Check scanning state
+  const [showCheckModal, setShowCheckModal] = useState(false)
+  const [checkScanning, setCheckScanning] = useState(false)
+  const [checkResults, setCheckResults] = useState<CheckScanResult[] | null>(null)
+  const [checkError, setCheckError] = useState<string | null>(null)
+  // Editable overrides for each scanned check (user corrections)
+  const [checkEdits, setCheckEdits] = useState<Record<number, { suiteNumber?: string; amount?: string; checkNumber?: string; fridayKey?: string }>>({})
+
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const checkInputRef = useRef<HTMLInputElement>(null)
 
   // Load month data from localStorage when month changes
   useEffect(() => {
@@ -185,6 +195,127 @@ export default function RentTracker() {
   const handleDisconnectGmail = useCallback(async () => {
     await fetch('/api/auth/google/logout', { method: 'POST' })
     setGmailConnected(false)
+  }, [])
+
+  // ---- Check image scanning ----
+  const handleCheckImageSelect = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files
+    if (!files || files.length === 0) return
+
+    setCheckScanning(true)
+    setCheckError(null)
+    setCheckResults(null)
+    setCheckEdits({})
+    setShowCheckModal(true)
+
+    try {
+      // Convert files to base64
+      const images: Array<{ base64: string; mimeType: string; fileName: string }> = []
+
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i]
+        const base64 = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader()
+          reader.onload = () => {
+            const result = reader.result as string
+            // Strip data:image/xxx;base64, prefix
+            resolve(result.split(',')[1])
+          }
+          reader.onerror = reject
+          reader.readAsDataURL(file)
+        })
+        images.push({
+          base64,
+          mimeType: file.type || 'image/jpeg',
+          fileName: file.name,
+        })
+      }
+
+      const response = await fetch('/api/checks/scan', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ images }),
+      })
+
+      const data = await response.json()
+
+      if (!response.ok) {
+        setCheckError(data.error || 'Failed to scan checks')
+        setCheckScanning(false)
+        return
+      }
+
+      setCheckResults(data.results)
+    } catch (err) {
+      setCheckError('Error scanning checks: ' + (err as Error).message)
+    } finally {
+      setCheckScanning(false)
+      // Reset file input
+      if (checkInputRef.current) checkInputRef.current.value = ''
+    }
+  }, [])
+
+  // Apply scanned/edited check data to the month
+  const handleApplyChecks = useCallback(() => {
+    if (!checkResults) return
+    const fridays = Object.keys(monthData.weeks).sort()
+
+    setMonthData(prev => {
+      const newWeeks = { ...prev.weeks }
+
+      for (const result of checkResults) {
+        const edits = checkEdits[result.imageIndex] || {}
+        const suiteNum = edits.suiteNumber ?? result.scanned.suiteNumber
+        const amountStr = edits.amount ?? (result.scanned.amount != null ? String(result.scanned.amount) : '')
+        const checkNum = edits.checkNumber ?? result.scanned.checkNumber
+        const fridayKey = edits.fridayKey || activeTab
+
+        if (!suiteNum || !amountStr || fridayKey === 'monthly-summary') continue
+        const amount = parseFloat(amountStr)
+        if (isNaN(amount) || amount <= 0) continue
+
+        // Find tenant by suite number
+        const tenant = TENANTS.find(t =>
+          t.suiteNumber === suiteNum ||
+          t.suiteNumber.includes(suiteNum) ||
+          suiteNum.includes(t.suiteNumber)
+        )
+        if (!tenant) continue
+
+        // Apply to the selected week
+        const targetFriday = fridayKey && fridays.includes(fridayKey) ? fridayKey : fridays[0]
+        if (!newWeeks[targetFriday]) continue
+
+        const entries = [...newWeeks[targetFriday]]
+        const idx = entries.findIndex(e => e.tenant.id === tenant.id)
+        if (idx === -1) continue
+
+        entries[idx] = {
+          ...entries[idx],
+          amountPaid: amount,
+          paymentType: 'Check',
+          status: amount >= entries[idx].amountDue ? 'paid' : 'partial',
+          checkNumber: checkNum || undefined,
+          confirmation: 'Check',
+          paymentSource: 'manual',
+        }
+        newWeeks[targetFriday] = entries
+      }
+
+      return { ...prev, weeks: newWeeks }
+    })
+
+    setShowCheckModal(false)
+    setCheckResults(null)
+    setCheckEdits({})
+  }, [checkResults, checkEdits, monthData, activeTab])
+
+  // Update an edit override for a scanned check
+  const updateCheckEdit = useCallback((index: number, field: string, value: string) => {
+    setCheckEdits(prev => ({
+      ...prev,
+      [index]: { ...prev[index], [field]: value },
+    }))
   }, [])
 
   const currentWeekEntries: MonthTenantEntry[] = useMemo(() => {
@@ -486,6 +617,22 @@ export default function RentTracker() {
                 <Mail size={14} /> Connect Gmail
               </a>
             )}
+            {/* Check scanning */}
+            <input
+              ref={checkInputRef}
+              type="file"
+              accept="image/*"
+              multiple
+              onChange={handleCheckImageSelect}
+              className="hidden"
+            />
+            <button
+              onClick={() => checkInputRef.current?.click()}
+              className="px-3 py-1.5 bg-amber-600 text-white text-sm font-medium rounded-lg hover:bg-amber-700 flex items-center gap-1.5"
+              title="Upload photos of check deposit slips to scan"
+            >
+              <Camera size={14} /> Scan Checks
+            </button>
             {!isMonthlySummaryTab && (
               <>
                 <button
@@ -885,6 +1032,188 @@ export default function RentTracker() {
                   )
                 })()}
               </>
+            )}
+          </div>
+        </Modal>
+      )}
+      {/* Check Scan Modal */}
+      {showCheckModal && (
+        <Modal
+          onClose={() => { setShowCheckModal(false); setCheckResults(null); setCheckError(null); setCheckEdits({}) }}
+          title="Scan Check Deposit Slips"
+        >
+          <div className="space-y-4">
+            {checkError && (
+              <div className="bg-red-50 border border-red-200 rounded-lg px-3 py-2 text-sm text-red-700">
+                {checkError}
+              </div>
+            )}
+
+            {/* Scanning in progress */}
+            {checkScanning && (
+              <div className="text-center py-8 space-y-3">
+                <Loader2 size={28} className="animate-spin mx-auto text-amber-600" />
+                <p className="text-sm text-gray-600">Reading handwriting from check images...</p>
+                <p className="text-xs text-gray-400">This may take a few seconds per image</p>
+              </div>
+            )}
+
+            {/* Results */}
+            {checkResults && !checkScanning && (
+              <div className="space-y-3">
+                <div className="text-sm text-gray-700">
+                  Scanned <strong>{checkResults.length}</strong> check image{checkResults.length !== 1 ? 's' : ''}.
+                  {' '}<strong className="text-green-700">
+                    {checkResults.filter(r => r.scanned.suiteNumber && r.scanned.amount).length}
+                  </strong> successfully read.
+                </div>
+
+                <div className="max-h-[400px] overflow-y-auto space-y-3">
+                  {checkResults.map((result, i) => {
+                    const edits = checkEdits[i] || {}
+                    const suite = edits.suiteNumber ?? result.scanned.suiteNumber ?? ''
+                    const amount = edits.amount ?? (result.scanned.amount != null ? String(result.scanned.amount) : '')
+                    const checkNum = edits.checkNumber ?? result.scanned.checkNumber ?? ''
+                    const fridayKey = edits.fridayKey || (activeTab !== 'monthly-summary' ? activeTab : '')
+                    const sortedFri = Object.keys(monthData.weeks).sort()
+
+                    // Find matching tenant for preview
+                    const matchedTenant = TENANTS.find(t =>
+                      t.suiteNumber === suite ||
+                      t.suiteNumber.includes(suite) ||
+                      (suite && suite.includes(t.suiteNumber))
+                    )
+
+                    const confidence = result.scanned.confidence
+                    const hasSuite = !!suite
+                    const hasAmount = !!amount && parseFloat(amount) > 0
+
+                    return (
+                      <div
+                        key={i}
+                        className={cn(
+                          'border rounded-lg px-3 py-3 text-sm',
+                          result.error ? 'bg-red-50 border-red-200' :
+                          confidence === 'high' && hasSuite && hasAmount ? 'bg-green-50 border-green-200' :
+                          confidence === 'low' || !hasSuite || !hasAmount ? 'bg-yellow-50 border-yellow-200' :
+                          'bg-blue-50 border-blue-200'
+                        )}
+                      >
+                        <div className="flex items-center justify-between mb-2">
+                          <div className="flex items-center gap-2">
+                            <Image size={14} className="text-gray-400" />
+                            <span className="font-medium text-gray-700 text-xs">{result.fileName}</span>
+                          </div>
+                          <span className={cn(
+                            'text-[10px] px-1.5 py-0.5 rounded font-medium',
+                            confidence === 'high' ? 'bg-green-100 text-green-700' :
+                            confidence === 'medium' ? 'bg-blue-100 text-blue-700' :
+                            'bg-yellow-100 text-yellow-700'
+                          )}>
+                            {confidence} confidence
+                          </span>
+                        </div>
+
+                        {result.error ? (
+                          <p className="text-xs text-red-600">Error: {result.error}</p>
+                        ) : (
+                          <div className="grid grid-cols-4 gap-2">
+                            <div>
+                              <label className="block text-[10px] font-medium text-gray-500 uppercase mb-0.5">Suite #</label>
+                              <input
+                                type="text"
+                                value={suite}
+                                onChange={e => updateCheckEdit(i, 'suiteNumber', e.target.value)}
+                                className={cn(
+                                  'w-full border rounded px-2 py-1 text-sm',
+                                  matchedTenant ? 'border-green-300 bg-green-50' : suite ? 'border-yellow-300 bg-yellow-50' : 'border-gray-300'
+                                )}
+                                placeholder="e.g. 110"
+                              />
+                              {matchedTenant && (
+                                <p className="text-[10px] text-green-700 mt-0.5 truncate">{matchedTenant.name}</p>
+                              )}
+                            </div>
+                            <div>
+                              <label className="block text-[10px] font-medium text-gray-500 uppercase mb-0.5">Amount</label>
+                              <input
+                                type="text"
+                                value={amount}
+                                onChange={e => updateCheckEdit(i, 'amount', e.target.value)}
+                                className="w-full border border-gray-300 rounded px-2 py-1 text-sm"
+                                placeholder="e.g. 220"
+                              />
+                            </div>
+                            <div>
+                              <label className="block text-[10px] font-medium text-gray-500 uppercase mb-0.5">Check #</label>
+                              <input
+                                type="text"
+                                value={checkNum}
+                                onChange={e => updateCheckEdit(i, 'checkNumber', e.target.value)}
+                                className="w-full border border-gray-300 rounded px-2 py-1 text-sm"
+                                placeholder="e.g. 1234"
+                              />
+                            </div>
+                            <div>
+                              <label className="block text-[10px] font-medium text-gray-500 uppercase mb-0.5">Week</label>
+                              <select
+                                value={fridayKey}
+                                onChange={e => updateCheckEdit(i, 'fridayKey', e.target.value)}
+                                className="w-full border border-gray-300 rounded px-2 py-1 text-sm bg-white"
+                              >
+                                {sortedFri.map((f, wi) => (
+                                  <option key={f} value={f}>Week {wi + 1} ({fridayShortLabel(f)})</option>
+                                ))}
+                              </select>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
+
+                <div className="flex gap-2 pt-2">
+                  <button
+                    onClick={handleApplyChecks}
+                    disabled={!checkResults.some((r, i) => {
+                      const edits = checkEdits[i] || {}
+                      const suite = edits.suiteNumber ?? r.scanned.suiteNumber
+                      const amount = edits.amount ?? (r.scanned.amount != null ? String(r.scanned.amount) : '')
+                      return suite && amount && parseFloat(amount) > 0
+                    })}
+                    className="flex-1 px-4 py-2 bg-amber-600 text-white text-sm font-medium rounded-lg hover:bg-amber-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    Apply {checkResults.filter((r, i) => {
+                      const edits = checkEdits[i] || {}
+                      const suite = edits.suiteNumber ?? r.scanned.suiteNumber
+                      const amount = edits.amount ?? (r.scanned.amount != null ? String(r.scanned.amount) : '')
+                      return suite && amount && parseFloat(amount) > 0
+                    }).length} Check{checkResults.length !== 1 ? 's' : ''}
+                  </button>
+                  <button
+                    onClick={() => checkInputRef.current?.click()}
+                    className="px-4 py-2 text-gray-600 text-sm hover:text-gray-800"
+                  >
+                    Upload More
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Empty state — not scanning, no results */}
+            {!checkScanning && !checkResults && !checkError && (
+              <div className="text-center py-8 space-y-3">
+                <Camera size={32} className="mx-auto text-gray-300" />
+                <p className="text-sm text-gray-600">Upload photos of the backs of check deposit slips.</p>
+                <p className="text-xs text-gray-400">Claude AI will read the handwriting and extract suite number, amount, and check number.</p>
+                <button
+                  onClick={() => checkInputRef.current?.click()}
+                  className="px-5 py-2 bg-amber-600 text-white text-sm font-medium rounded-lg hover:bg-amber-700 flex items-center gap-2 mx-auto"
+                >
+                  <Upload size={14} /> Select Images
+                </button>
+              </div>
             )}
           </div>
         </Modal>

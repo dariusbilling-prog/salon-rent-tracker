@@ -75,6 +75,12 @@ export async function POST(request: NextRequest) {
     }
 
     debug.totalFound = payments.length
+    // Grab query-level debug info from fetchZelleEmails
+    const queryDebug = (fetchZelleEmails as any).__lastDebug
+    if (queryDebug) {
+      debug.queryResults = queryDebug.queryResults
+      debug.successfulQuery = queryDebug.successfulQuery
+    }
     if (payments.length > 0) {
       debug.firstPayment = { sender: payments[0].senderName, amount: payments[0].amount, date: payments[0].dateReceived }
     }

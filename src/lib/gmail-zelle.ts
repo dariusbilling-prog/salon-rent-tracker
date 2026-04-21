@@ -218,25 +218,63 @@ export async function fetchZelleEmails(
   beforeEnd.setDate(beforeEnd.getDate() + 1) // include the end date
   const beforeStr = `${beforeEnd.getFullYear()}/${beforeEnd.getMonth() + 1}/${beforeEnd.getDate()}`
 
-  // Simple broad query: just find anything with "Zelle" in the date range
-  // We filter more precisely in code after fetching each message
-  const query = `Zelle after:${afterStr} before:${beforeStr}`
+  const dateFilter = `after:${afterStr} before:${beforeStr}`
 
-  // Step 1: list messages matching the query
-  const listUrl = `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent(query)}&maxResults=100`
-  const listResponse = await fetch(listUrl, {
-    headers: { Authorization: `Bearer ${accessToken}` },
-  })
+  // Try multiple search queries — different approaches to find forwarded Zelle emails
+  const queries = [
+    `Zelle ${dateFilter}`,
+    `"received money" ${dateFilter}`,
+    `subject:Zelle ${dateFilter}`,
+    `"sent you money" ${dateFilter}`,
+    `from:chase ${dateFilter}`,
+    `subject:"received money" ${dateFilter}`,
+  ]
 
-  if (!listResponse.ok) {
-    const errorBody = await listResponse.text()
-    throw new Error(`Gmail list failed (${listResponse.status}): ${errorBody.slice(0, 500)}`)
+  let messageIds: string[] = []
+  let successfulQuery = ''
+  const queryResults: Record<string, number> = {}
+
+  for (const query of queries) {
+    try {
+      const listUrl = `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent(query)}&maxResults=100`
+      const listResponse = await fetch(listUrl, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      })
+
+      if (!listResponse.ok) continue
+
+      const listData = await listResponse.json()
+      const ids: string[] = (listData.messages || []).map((m: any) => m.id)
+      queryResults[query] = ids.length
+
+      if (ids.length > 0 && messageIds.length === 0) {
+        messageIds = ids
+        successfulQuery = query
+      }
+    } catch {
+      queryResults[query] = -1 // error
+    }
   }
 
-  const listData = await listResponse.json()
-  const messageIds: string[] = (listData.messages || []).map((m: any) => m.id)
+  // If still nothing, try one last very broad search to verify API works at all
+  if (messageIds.length === 0) {
+    try {
+      const broadUrl = `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent(dateFilter)}&maxResults=5`
+      const broadResponse = await fetch(broadUrl, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      })
+      if (broadResponse.ok) {
+        const broadData = await broadResponse.json()
+        queryResults[`[BROAD] ${dateFilter}`] = (broadData.messages || []).length
+      }
+    } catch { /* ignore */ }
+  }
 
-  console.log(`[Zelle] Query: "${query}" → ${messageIds.length} messages found`)
+  console.log(`[Zelle] Query results:`, JSON.stringify(queryResults))
+  console.log(`[Zelle] Using query: "${successfulQuery}" → ${messageIds.length} messages`)
+
+  // Store query debug info on the results (will be picked up by the API route)
+  ;(fetchZelleEmails as any).__lastDebug = { queryResults, successfulQuery, messageCount: messageIds.length }
 
   if (messageIds.length === 0) return []
 
