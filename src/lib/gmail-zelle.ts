@@ -97,109 +97,128 @@ function toISODate(date: Date): string {
 
 // Parse a Chase Zelle notification email body/subject to extract payment details
 // Handles BOTH direct Chase emails AND forwarded Chase emails from accountant
-// Chase email formats:
-//   Subject: "You received $XXX from NAME with Zelle®"
-//   Subject: "NAME sent you $XXX.XX with Zelle®"
-//   Subject: "Fwd: You received money with Zelle®"  (forwarded — details in body)
-//   Body: "FirstName LastName sent you $XXX.XX" or similar
-//   Body (forwarded): Contains original Chase notification with sender/amount
+//
+// Actual Chase forwarded email format (from screenshots):
+//   Subject: "Fwd: You received money with Zelle®"
+//   Body (HTML after stripping): "... KELLI TANNER sent you money Here are the details:
+//     Amount $235.00 Sent on Apr 21, 2026 Transaction number 28911496529
+//     Memo Suite 133 kelli tanner ..."
+//
+// Key insight: the name and amount are SEPARATE in Chase emails.
+// "KELLI TANNER sent you money" is the heading, "Amount $235.00" is in a table row below.
 export function parseChaseZelleEmail(subject: string, body: string): {
   senderName: string | null
   amount: number | null
   memo?: string
-  originalDate?: string // ISO date extracted from forwarded email content
+  originalDate?: string
 } {
   const cleanBody = stripHtml(body)
-  // Strip "Fwd:" or "Fwd: " prefix from subject for cleaner matching
   const cleanSubject = subject.replace(/^Fwd:\s*/i, '').trim()
   const combined = `${cleanSubject} ${cleanBody}`
 
-  // Try to extract amount — look for $XXX or $XXX.XX
+  // ---- AMOUNT ----
+  // Chase format: "Amount $235.00" in a table row (most reliable)
   let amount: number | null = null
   const amountPatterns = [
+    // Chase table format: "Amount $235.00" or "Amount: $235.00"
+    /Amount[:\s]+\$([\d,]+(?:\.\d{2})?)/i,
     // "sent you $250.00" or "received $250.00"
     /(?:received|sent you|you received)\s*\$([\d,]+(?:\.\d{2})?)/i,
     // "$250.00 from NAME" or "$250.00 with Zelle"
     /\$([\d,]+(?:\.\d{2})?)\s*(?:from|has been|with Zelle)/i,
-    // Any dollar amount with cents
+    // Any dollar amount with cents (but skip small amounts like $1.00 from footer links)
     /\$([\d,]+\.\d{2})/,
-    // Any dollar amount
-    /\$([\d,]+)/,
   ]
   for (const pattern of amountPatterns) {
     const match = combined.match(pattern)
     if (match) {
-      amount = parseFloat(match[1].replace(/,/g, ''))
-      if (!isNaN(amount) && amount > 0) break
-      amount = null
+      const val = parseFloat(match[1].replace(/,/g, ''))
+      // Skip tiny amounts that are likely from footer/links, not actual payments
+      if (!isNaN(val) && val >= 50) {
+        amount = val
+        break
+      }
     }
   }
 
-  // Try to extract sender name — check both subject and body
+  // ---- SENDER NAME ----
+  // Chase format: "KELLI TANNER sent you money" (no dollar amount after "sent you")
   let senderName: string | null = null
   const namePatterns = [
-    // "NAME sent you $XXX with Zelle"
-    /(.+?)\s+sent you\s+\$[\d.,]+/i,
-    // "You received $XXX from NAME with Zelle"
-    /You received\s+\$[\d.,]+\s+from\s+(.+?)(?:\s+with Zelle|\s*\.|\s*$)/i,
+    // Chase heading: "NAME sent you money" (the actual format!)
+    /([A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+)+)\s+sent you money/,
+    // "NAME sent you money" case-insensitive
+    /(.+?)\s+sent you money/i,
+    // "NAME sent you $XXX"
+    /(.+?)\s+sent you\s+\$/i,
+    // "You received $XXX from NAME"
+    /You received\s+\$[\d.,]+\s+from\s+(.+?)(?:\s+with|\s*\.|\s*$)/i,
     // "received money from NAME"
     /received (?:money |a payment )?from\s+(.+?)(?:\s+for|\s*\.|\s+with|\s+on|\s*$)/i,
     // "NAME has sent you"
     /(.+?)\s+has sent you/i,
-    // Just "from NAME" near Zelle context
-    /from\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)(?:\s|\.|\,|$)/,
   ]
 
-  // Try subject first (most reliable), then body
   for (const pattern of namePatterns) {
-    const match = cleanSubject.match(pattern) || cleanBody.match(pattern)
+    const match = cleanBody.match(pattern) || cleanSubject.match(pattern)
     if (match) {
       let name = match[1].trim()
-      // Clean trailing punctuation, "Fwd:", and common noise
       name = name.replace(/^(?:Fwd|Re|FW):\s*/i, '').trim()
       name = name.replace(/[.,;:!?]+$/, '').trim()
-      // Skip if too long (probably a phrase) or too short
-      if (name.length > 1 && name.length < 80 && !name.toLowerCase().includes('zelle')) {
+      // Skip noise words and too-long/too-short matches
+      if (name.length > 1 && name.length < 80 &&
+          !name.toLowerCase().includes('zelle') &&
+          !name.toLowerCase().includes('chase') &&
+          !name.toLowerCase().includes('begin forwarded')) {
         senderName = name
         break
       }
     }
   }
 
-  // Try to extract original date from forwarded email content
-  // Look for patterns like "Date: April 10, 2026" or "April 10, 2026 at 3:45 PM"
+  // ---- DATE ----
+  // Chase format: "Sent on Apr 21, 2026" or "Date: April 21, 2026 at 9:42:58 AM"
   let originalDate: string | undefined
   const datePatterns = [
-    /Date:\s*([A-Z][a-z]+\s+\d{1,2},?\s+\d{4})/i,
-    /(?:on|dated?)\s+([A-Z][a-z]+\s+\d{1,2},?\s+\d{4})/i,
+    // Chase table: "Sent on Apr 21, 2026"
+    /Sent on\s+([A-Z][a-z]+\.?\s+\d{1,2},?\s+\d{4})/i,
+    // Forwarded header: "Date: April 21, 2026 at ..."
+    /Date:\s*([A-Z][a-z]+\.?\s+\d{1,2},?\s+\d{4})/i,
+    // "April 21, 2026 at 3:45 PM"
+    /([A-Z][a-z]+\.?\s+\d{1,2},?\s+\d{4})\s+at\s+\d/i,
+    // Numeric: MM/DD/YYYY
     /(\d{1,2}\/\d{1,2}\/\d{4})/,
-    /([A-Z][a-z]+\s+\d{1,2},?\s+\d{4})\s+at\s+\d/i,
   ]
   for (const pattern of datePatterns) {
     const match = cleanBody.match(pattern)
     if (match) {
       try {
         const parsed = new Date(match[1])
-        if (!isNaN(parsed.getTime())) {
+        if (!isNaN(parsed.getTime()) && parsed.getFullYear() >= 2024) {
           originalDate = toISODate(parsed)
           break
         }
-      } catch { /* ignore parse failures */ }
+      } catch { /* ignore */ }
     }
   }
 
-  // Try to extract optional memo/message
+  // ---- MEMO ----
+  // Chase format: "Memo Suite 133 kelli tanner" (contains suite info!)
   let memo: string | undefined
   const memoPatterns = [
-    /(?:message|memo|note)[:\s]+["']?([^"'\n]{1,200})["']?/i,
-    /sent you \$[\d.,]+ (?:for|with) (?:the )?(?:message|note)[:\s]+["']?([^"'\n]{1,200})["']?/i,
+    // Chase table: "Memo XXXX" or "Memo: XXXX"
+    /Memo[:\s]+([^\n]{1,200}?)(?:\s+[A-Z]{2,}|\s*$)/i,
+    /Memo[:\s]+(.+?)(?:\s{2,}|$)/i,
+    /(?:message|note)[:\s]+["']?([^"'\n]{1,200})["']?/i,
   ]
   for (const pattern of memoPatterns) {
     const match = cleanBody.match(pattern)
     if (match && match[1]) {
-      memo = match[1].trim()
-      if (memo.length > 2) break
-      memo = undefined
+      const m = match[1].trim()
+      if (m.length > 1 && !m.toLowerCase().includes('registered with') && !m.toLowerCase().includes('member bank')) {
+        memo = m
+        break
+      }
     }
   }
 
