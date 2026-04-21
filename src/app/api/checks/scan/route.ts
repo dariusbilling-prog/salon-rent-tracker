@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { scanCheckImages, CheckScanResult } from '@/lib/check-scanner'
+import { scanDepositSlips, DepositSlipResult } from '@/lib/check-scanner'
 
 export async function POST(request: NextRequest) {
   const apiKey = process.env.GOOGLE_VISION_API_KEY || process.env.GOOGLE_API_KEY
@@ -29,14 +29,20 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    const results: CheckScanResult[] = await scanCheckImages(images, apiKey)
+    const results: DepositSlipResult[] = await scanDepositSlips(images, apiKey)
+
+    const totalEntries = results.reduce((sum, r) => sum + r.entries.length, 0)
+    const successfulEntries = results.reduce((sum, r) =>
+      sum + r.entries.filter(e => e.suiteNumber && e.amount).length, 0)
 
     return NextResponse.json({
       results,
       summary: {
-        total: results.length,
-        successful: results.filter(r => r.scanned.suiteNumber && r.scanned.amount).length,
-        needsReview: results.filter(r => r.scanned.confidence !== 'high').length,
+        totalImages: results.length,
+        totalEntries,
+        successful: successfulEntries,
+        needsReview: results.reduce((sum, r) =>
+          sum + r.entries.filter(e => e.confidence !== 'high').length, 0),
         failed: results.filter(r => r.error).length,
       },
     })
