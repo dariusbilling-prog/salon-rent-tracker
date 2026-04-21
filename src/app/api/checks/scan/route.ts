@@ -2,11 +2,11 @@ import { NextRequest, NextResponse } from 'next/server'
 import { scanCheckImages, CheckScanResult } from '@/lib/check-scanner'
 
 export async function POST(request: NextRequest) {
-  const apiKey = process.env.ANTHROPIC_API_KEY
+  const apiKey = process.env.GOOGLE_VISION_API_KEY || process.env.GOOGLE_API_KEY
 
   if (!apiKey) {
     return NextResponse.json(
-      { error: 'Check scanning is not configured. Add ANTHROPIC_API_KEY to environment variables.' },
+      { error: 'Check scanning is not configured. Add GOOGLE_VISION_API_KEY to Vercel environment variables.' },
       { status: 500 }
     )
   }
