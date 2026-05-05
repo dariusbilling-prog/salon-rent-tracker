@@ -61,7 +61,7 @@ export default function RentTracker() {
   const [checkResults, setCheckResults] = useState<DepositSlipResult[] | null>(null)
   const [checkError, setCheckError] = useState<string | null>(null)
   // Editable overrides for each scanned entry (keyed by "imageIndex-entryIndex")
-  const [checkEdits, setCheckEdits] = useState<Record<string, { suiteNumber?: string; amount?: string; checkNumber?: string; fridayKey?: string }>>({})
+  const [checkEdits, setCheckEdits] = useState<Record<string, { suiteNumber?: string; amount?: string; checkNumber?: string; fridayKey?: string; fridayKeys?: string[] }>>({})
 
   const fileInputRef = useRef<HTMLInputElement>(null)
   const checkInputRef = useRef<HTMLInputElement>(null)
@@ -249,7 +249,7 @@ export default function RentTracker() {
     }
   }, [])
 
-  // Apply scanned/edited check data to the month
+  // Apply scanned/edited check data to the month (supports multi-week payments)
   const handleApplyChecks = useCallback(() => {
     if (!checkResults) return
     const fridays = Object.keys(monthData.weeks).sort()
@@ -266,11 +266,9 @@ export default function RentTracker() {
           const suiteNum = edits.suiteNumber ?? entry.suiteNumber
           const amountStr = edits.amount ?? (entry.amount != null ? String(entry.amount) : '')
           const checkNum = edits.checkNumber ?? entry.checkNumber
-          const fridayKey = edits.fridayKey || (activeTab !== 'monthly-summary' ? activeTab : fridays[0])
+          const totalAmount = parseFloat(amountStr)
 
-          if (!suiteNum || !amountStr || fridayKey === 'monthly-summary') continue
-          const amount = parseFloat(amountStr)
-          if (isNaN(amount) || amount <= 0) continue
+          if (!suiteNum || isNaN(totalAmount) || totalAmount <= 0) continue
 
           // Find tenant by suite number
           const tenant = TENANTS.find(t =>
@@ -280,24 +278,36 @@ export default function RentTracker() {
           )
           if (!tenant) continue
 
-          // Apply to the selected week
-          const targetFriday = fridayKey && fridays.includes(fridayKey) ? fridayKey : fridays[0]
-          if (!newWeeks[targetFriday]) continue
+          // Multi-week: use fridayKeys[] if present, otherwise fall back to single fridayKey
+          const selectedWeeks = edits.fridayKeys && edits.fridayKeys.length > 0
+            ? edits.fridayKeys
+            : [edits.fridayKey || (activeTab !== 'monthly-summary' ? activeTab : fridays[0])]
 
-          const entries = [...newWeeks[targetFriday]]
-          const idx = entries.findIndex(e => e.tenant.id === tenant.id)
-          if (idx === -1) continue
+          const weeklyRent = tenant.weeklyRent
+          let remaining = totalAmount
 
-          entries[idx] = {
-            ...entries[idx],
-            amountPaid: amount,
-            paymentType: 'Check',
-            status: amount >= entries[idx].amountDue ? 'paid' : 'partial',
-            checkNumber: checkNum || undefined,
-            confirmation: 'Check',
-            paymentSource: 'manual',
+          for (const targetFriday of selectedWeeks) {
+            if (!targetFriday || !newWeeks[targetFriday]) continue
+
+            const entries = [...newWeeks[targetFriday]]
+            const idx = entries.findIndex(e => e.tenant.id === tenant.id)
+            if (idx === -1) continue
+
+            // Apply up to weeklyRent per week (or remaining if less)
+            const applyAmount = Math.min(remaining, weeklyRent)
+            remaining -= applyAmount
+
+            entries[idx] = {
+              ...entries[idx],
+              amountPaid: applyAmount,
+              paymentType: 'Check',
+              status: applyAmount >= entries[idx].amountDue ? 'paid' : 'partial',
+              checkNumber: checkNum || undefined,
+              confirmation: 'Check',
+              paymentSource: 'manual',
+            }
+            newWeeks[targetFriday] = entries
           }
-          newWeeks[targetFriday] = entries
         }
       }
 
@@ -473,7 +483,15 @@ export default function RentTracker() {
     paymentType: 'Zelle' as PaymentType,
     checkNumber: '',
     notes: '',
+    multiWeekKeys: [] as string[],
   })
+
+  // Multi-week detection for manual entry
+  const manualTenant = TENANTS.find(t => t.id === manualForm.tenantId)
+  const manualAmount = parseFloat(manualForm.amount) || 0
+  const manualIsMultiWeek = manualTenant && manualTenant.weeklyRent > 0 && manualAmount > manualTenant.weeklyRent
+  const manualWeeksCount = manualTenant && manualTenant.weeklyRent > 0 ? Math.floor(manualAmount / manualTenant.weeklyRent) : 0
+  const manualCreditAmount = manualTenant && manualTenant.weeklyRent > 0 ? manualAmount - (manualWeeksCount * manualTenant.weeklyRent) : 0
 
   const handleManualAdd = useCallback(() => {
     if (!manualForm.tenantId || !manualForm.amount) return
@@ -483,19 +501,55 @@ export default function RentTracker() {
     const confirmation =
       ['Zelle', 'Cash', 'Check', 'Money Order'].includes(manualForm.paymentType) ? 'Cash' : 'Card Processed'
 
-    const entry = currentWeekEntries.find(e => e.tenant.id === manualForm.tenantId)
-    updateEntry(manualForm.tenantId, {
-      amountPaid: amount,
-      paymentType: manualForm.paymentType,
-      status: amount >= (entry?.amountDue || 0) ? 'paid' : 'partial',
-      checkNumber: manualForm.checkNumber || undefined,
-      notes: manualForm.notes || undefined,
-      confirmation,
-    }, true) // markManual = true
+    const tenant = TENANTS.find(t => t.id === manualForm.tenantId)
+    const weeklyRent = tenant?.weeklyRent || 0
 
-    setManualForm({ tenantId: '', amount: '', paymentType: 'Zelle', checkNumber: '', notes: '' })
+    // Multi-week: apply across selected weeks
+    if (manualForm.multiWeekKeys.length > 1 && weeklyRent > 0) {
+      const fridays = Object.keys(monthData.weeks).sort()
+      setMonthData(prev => {
+        const newWeeks = { ...prev.weeks }
+        let remaining = amount
+
+        for (const fridayKey of manualForm.multiWeekKeys) {
+          if (!newWeeks[fridayKey] || !fridays.includes(fridayKey)) continue
+          const entries = [...newWeeks[fridayKey]]
+          const idx = entries.findIndex(e => e.tenant.id === manualForm.tenantId)
+          if (idx === -1) continue
+
+          const applyAmount = Math.min(remaining, weeklyRent)
+          remaining -= applyAmount
+
+          entries[idx] = {
+            ...entries[idx],
+            amountPaid: applyAmount,
+            paymentType: manualForm.paymentType,
+            status: applyAmount >= entries[idx].amountDue ? 'paid' : 'partial',
+            checkNumber: manualForm.checkNumber || undefined,
+            notes: manualForm.notes || undefined,
+            confirmation,
+            paymentSource: 'manual',
+          }
+          newWeeks[fridayKey] = entries
+        }
+        return { ...prev, weeks: newWeeks }
+      })
+    } else {
+      // Single-week: apply to current week (original behavior)
+      const entry = currentWeekEntries.find(e => e.tenant.id === manualForm.tenantId)
+      updateEntry(manualForm.tenantId, {
+        amountPaid: amount,
+        paymentType: manualForm.paymentType,
+        status: amount >= (entry?.amountDue || 0) ? 'paid' : 'partial',
+        checkNumber: manualForm.checkNumber || undefined,
+        notes: manualForm.notes || undefined,
+        confirmation,
+      }, true) // markManual = true
+    }
+
+    setManualForm({ tenantId: '', amount: '', paymentType: 'Zelle', checkNumber: '', notes: '', multiWeekKeys: [] })
     setShowManualEntry(false)
-  }, [manualForm, currentWeekEntries, updateEntry])
+  }, [manualForm, currentWeekEntries, updateEntry, monthData])
 
   // SMS reminders
   const getLateTenants = useCallback(() => {
@@ -833,6 +887,59 @@ export default function RentTracker() {
                 />
               </div>
             )}
+            {/* Multi-week selector for manual entry */}
+            {manualIsMultiWeek && (() => {
+              const sortedFri = Object.keys(monthData.weeks).sort()
+              return (
+                <div className="border border-purple-200 bg-purple-50 rounded-lg px-3 py-2">
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-xs font-semibold text-purple-700">
+                      Covers {manualWeeksCount} week{manualWeeksCount !== 1 ? 's' : ''} at {formatCurrency(manualTenant!.weeklyRent)}/wk
+                      {manualCreditAmount > 0 && (
+                        <span className="text-amber-600 ml-1">+ {formatCurrency(manualCreditAmount)} credit</span>
+                      )}
+                    </span>
+                    <span className={cn(
+                      'text-[10px] px-1.5 py-0.5 rounded font-medium',
+                      manualForm.multiWeekKeys.length === manualWeeksCount ? 'bg-green-100 text-green-700' :
+                      manualForm.multiWeekKeys.length > 0 ? 'bg-amber-100 text-amber-700' :
+                      'bg-gray-100 text-gray-500'
+                    )}>
+                      {manualForm.multiWeekKeys.length} of {manualWeeksCount} selected
+                    </span>
+                  </div>
+                  <p className="text-[10px] text-purple-600 mb-2">Select which weeks to apply this payment to:</p>
+                  <div className="flex flex-wrap gap-1.5">
+                    {sortedFri.map((f, wi) => {
+                      const isSelected = manualForm.multiWeekKeys.includes(f)
+                      return (
+                        <button
+                          key={f}
+                          type="button"
+                          onClick={() => {
+                            setManualForm(prev => ({
+                              ...prev,
+                              multiWeekKeys: isSelected
+                                ? prev.multiWeekKeys.filter(k => k !== f)
+                                : [...prev.multiWeekKeys, f],
+                            }))
+                          }}
+                          className={cn(
+                            'px-3 py-1.5 rounded text-xs font-medium border transition-colors',
+                            isSelected
+                              ? 'bg-purple-600 text-white border-purple-600'
+                              : 'bg-white text-gray-600 border-gray-300 hover:border-purple-400'
+                          )}
+                        >
+                          {isSelected && <Check size={10} className="inline mr-1 -mt-0.5" />}
+                          Week {wi + 1} ({fridayShortLabel(f)})
+                        </button>
+                      )
+                    })}
+                  </div>
+                </div>
+              )
+            })()}
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-1">Notes (optional)</label>
               <input
@@ -1112,6 +1219,14 @@ export default function RentTracker() {
                           const hasSuite = !!suite
                           const hasAmount = !!amount && parseFloat(amount) > 0
 
+                          // Multi-week detection
+                          const amountVal = parseFloat(amount) || 0
+                          const weeklyRent = matchedTenant?.weeklyRent || 0
+                          const isMultiWeek = matchedTenant && weeklyRent > 0 && amountVal > weeklyRent
+                          const weeksCount = weeklyRent > 0 ? Math.floor(amountVal / weeklyRent) : 0
+                          const creditAmount = weeklyRent > 0 ? amountVal - (weeksCount * weeklyRent) : 0
+                          const selectedFridayKeys = edits.fridayKeys || []
+
                           return (
                             <div
                               key={editKey}
@@ -1139,7 +1254,7 @@ export default function RentTracker() {
                                 </div>
                               </div>
 
-                              <div className="grid grid-cols-4 gap-2">
+                              <div className="grid grid-cols-3 gap-2">
                                 <div>
                                   <label className="block text-[10px] font-medium text-gray-500 uppercase mb-0.5">Suite #</label>
                                   <input
@@ -1173,7 +1288,60 @@ export default function RentTracker() {
                                     placeholder="e.g. 1234"
                                   />
                                 </div>
-                                <div>
+                              </div>
+
+                              {/* Multi-week selector or single week dropdown */}
+                              {isMultiWeek ? (
+                                <div className="mt-2 border-t pt-2">
+                                  <div className="flex items-center justify-between mb-1.5">
+                                    <span className="text-[10px] font-semibold text-purple-700 uppercase">
+                                      Covers {weeksCount} week{weeksCount !== 1 ? 's' : ''} at {formatCurrency(weeklyRent)}/wk
+                                      {creditAmount > 0 && (
+                                        <span className="text-amber-600 ml-1">+ {formatCurrency(creditAmount)} credit</span>
+                                      )}
+                                    </span>
+                                    <span className={cn(
+                                      'text-[10px] px-1.5 py-0.5 rounded font-medium',
+                                      selectedFridayKeys.length === weeksCount ? 'bg-green-100 text-green-700' :
+                                      selectedFridayKeys.length > 0 ? 'bg-amber-100 text-amber-700' :
+                                      'bg-gray-100 text-gray-500'
+                                    )}>
+                                      {selectedFridayKeys.length} of {weeksCount} selected
+                                    </span>
+                                  </div>
+                                  <div className="flex flex-wrap gap-1.5">
+                                    {sortedFri.map((f, wi) => {
+                                      const isSelected = selectedFridayKeys.includes(f)
+                                      return (
+                                        <button
+                                          key={f}
+                                          type="button"
+                                          onClick={() => {
+                                            const current = edits.fridayKeys || []
+                                            const updated = isSelected
+                                              ? current.filter(k => k !== f)
+                                              : [...current, f]
+                                            setCheckEdits(prev => ({
+                                              ...prev,
+                                              [editKey]: { ...prev[editKey], fridayKeys: updated },
+                                            }))
+                                          }}
+                                          className={cn(
+                                            'px-2.5 py-1 rounded text-[11px] font-medium border transition-colors',
+                                            isSelected
+                                              ? 'bg-purple-600 text-white border-purple-600'
+                                              : 'bg-white text-gray-600 border-gray-300 hover:border-purple-400'
+                                          )}
+                                        >
+                                          {isSelected && <Check size={10} className="inline mr-1 -mt-0.5" />}
+                                          Wk {wi + 1} ({fridayShortLabel(f)})
+                                        </button>
+                                      )
+                                    })}
+                                  </div>
+                                </div>
+                              ) : (
+                                <div className="mt-2">
                                   <label className="block text-[10px] font-medium text-gray-500 uppercase mb-0.5">Week</label>
                                   <select
                                     value={fridayKey}
@@ -1185,7 +1353,7 @@ export default function RentTracker() {
                                     ))}
                                   </select>
                                 </div>
-                              </div>
+                              )}
                             </div>
                           )
                         })
