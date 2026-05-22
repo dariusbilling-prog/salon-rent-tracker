@@ -2125,6 +2125,8 @@ function EntryRow({
   const { tenant, status, isVacant } = entry
   const isSpecial = status === 'free_week' || status === 'comped_week'
   const isPending = status === 'monthly_pending' || status === 'biweekly_off'
+  // Monthly tenants should still show payment fields — only bi-weekly off weeks are truly disabled
+  const isPaymentDisabled = isSpecial || status === 'biweekly_off'
 
   const rowBg = isVacant
     ? 'bg-gray-50/70'
@@ -2189,7 +2191,7 @@ function EntryRow({
       <td className="px-3 py-1.5 text-sm text-right font-mono">
         {isVacant ? (
           <span className="text-gray-300">—</span>
-        ) : isSpecial || isPending ? (
+        ) : isPaymentDisabled ? (
           <span className="text-gray-400 text-xs italic">{isSpecial ? 'N/A' : '—'}</span>
         ) : isEditing ? (
           <input
@@ -2215,7 +2217,7 @@ function EntryRow({
       </td>
 
       <td className="px-3 py-1.5">
-        {!isVacant && !isSpecial && !isPending && (
+        {!isVacant && !isPaymentDisabled && (
           <select
             value={entry.paymentType || ''}
             onChange={e => onUpdate(tenant.id, { paymentType: e.target.value as PaymentType })}
@@ -2248,7 +2250,7 @@ function EntryRow({
       </td>
 
       <td className="px-3 py-1.5">
-        {!isVacant && !isSpecial && !isPending && (
+        {!isVacant && !isPaymentDisabled && (
           <input
             type="text"
             value={entry.checkNumber || ''}
