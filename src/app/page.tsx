@@ -5,10 +5,11 @@ import {
   Upload, Plus, FileDown, ChevronLeft, ChevronRight,
   Check, AlertCircle, Clock, Gift, Heart, Calendar, Repeat,
   MessageSquare, Phone, Send, Loader2, StickyNote, X, BarChart3,
-  TrendingUp, CreditCard, RefreshCw, Mail, CheckCircle2, Camera, Image
+  TrendingUp, CreditCard, RefreshCw, Mail, CheckCircle2, Camera, Image,
+  Pencil, DoorOpen, UserPlus, ChevronDown, Archive, Wallet
 } from 'lucide-react'
-import { TenantWeekEntry, WeekStatus, PaymentType, BillingFrequency } from '@/types'
-import { TENANTS } from '@/lib/tenant-data'
+import { Tenant, TenantWeekEntry, WeekStatus, PaymentType, BillingFrequency } from '@/types'
+import { TENANTS as DEFAULT_TENANTS } from '@/lib/tenant-data'
 import {
   formatCurrency, getStatusLabel, getStatusColor, cn,
   getCurrentMonthKey, monthLabel, addMonths, fridayShortLabel, fridayFullLabel,
@@ -23,6 +24,11 @@ import {
   matchZellePayments, applyZelleMatchesToMonth, ZelleMatch
 } from '@/lib/month-data'
 import { DepositSlipResult } from '@/lib/check-scanner'
+import {
+  loadTenants, saveTenants, createTenant, updateTenant, archiveTenant,
+  getActiveTenants, getArchivedTenants, loadCredits, saveCredits, addCredit,
+  useCredit, getTenantCredit, TenantFormData
+} from '@/lib/tenant-manager'
 
 const WEEK_STATUSES: WeekStatus[] = ['paid', 'partial', 'late', 'unpaid', 'free_week', 'comped_week']
 const PAYMENT_TYPES: PaymentType[] = ['ACH', 'Zelle', 'Check', 'Cash', 'Money Order', 'Card']
@@ -38,7 +44,9 @@ type ActiveTab = string | 'monthly-summary'
 
 export default function RentTracker() {
   const [monthKey, setMonthKey] = useState<string>(() => getCurrentMonthKey())
-  const [monthData, setMonthData] = useState<MonthData>(() => createEmptyMonth(monthKey, TENANTS))
+  const [tenants, setTenants] = useState<Tenant[]>(() => loadTenants())
+  const [credits, setCredits] = useState<Record<string, number>>(() => loadCredits())
+  const [monthData, setMonthData] = useState<MonthData>(() => createEmptyMonth(monthKey, getActiveTenants(loadTenants())))
   const [activeTab, setActiveTab] = useState<ActiveTab>('')
   const [editingCell, setEditingCell] = useState<string | null>(null)
   const [showManualEntry, setShowManualEntry] = useState(false)
@@ -60,23 +68,35 @@ export default function RentTracker() {
   const [checkScanning, setCheckScanning] = useState(false)
   const [checkResults, setCheckResults] = useState<DepositSlipResult[] | null>(null)
   const [checkError, setCheckError] = useState<string | null>(null)
-  // Editable overrides for each scanned entry (keyed by "imageIndex-entryIndex")
   const [checkEdits, setCheckEdits] = useState<Record<string, { suiteNumber?: string; amount?: string; checkNumber?: string; fridayKey?: string; fridayKeys?: string[] }>>({})
+
+  // Tenant management state
+  const [showTenantPanel, setShowTenantPanel] = useState(false)
+  const [tenantPanelMode, setTenantPanelMode] = useState<'add' | 'edit'>('add')
+  const [selectedTenantId, setSelectedTenantId] = useState<string | null>(null)
+  const [tenantPanelSuite, setTenantPanelSuite] = useState('')
+  const [showPastTenants, setShowPastTenants] = useState(false)
+  const [showMoveOutConfirm, setShowMoveOutConfirm] = useState<string | null>(null)
+  const [moveOutDate, setMoveOutDate] = useState('')
+
+  // Credit prompt state
+  const [creditPrompt, setCreditPrompt] = useState<{ tenantId: string; creditAmount: number; paymentContext: string } | null>(null)
 
   const fileInputRef = useRef<HTMLInputElement>(null)
   const checkInputRef = useRef<HTMLInputElement>(null)
 
+  const activeTenants = useMemo(() => getActiveTenants(tenants), [tenants])
+  const archivedTenants = useMemo(() => getArchivedTenants(tenants), [tenants])
+
   // Load month data from localStorage when month changes
   useEffect(() => {
     const loaded = loadMonthData(monthKey)
-    const data = loaded || createEmptyMonth(monthKey, TENANTS)
+    const data = loaded || createEmptyMonth(monthKey, activeTenants)
     setMonthData(data)
-
-    // Default to first week tab
     const firstFriday = Object.keys(data.weeks).sort()[0]
     setActiveTab(firstFriday || '')
     setSmsSentThisWeek(new Set())
-  }, [monthKey])
+  }, [monthKey]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Auto-save to localStorage on any change
   useEffect(() => {
@@ -92,12 +112,10 @@ export default function RentTracker() {
       .then(d => setGmailConnected(!!d.connected))
       .catch(() => setGmailConnected(false))
 
-    // Show success/error from OAuth redirect
     const url = new URL(window.location.href)
     const authStatus = url.searchParams.get('gmail_auth')
     if (authStatus === 'success') {
       setGmailConnected(true)
-      // Clean the URL
       url.searchParams.delete('gmail_auth')
       window.history.replaceState({}, '', url.pathname)
     } else if (authStatus === 'error') {
@@ -123,8 +141,6 @@ export default function RentTracker() {
         return
       }
 
-      // Scan from 6 days before the first Friday (to catch the Saturday prior)
-      // through the last Friday of the month
       const firstFriday = new Date(fridays[0] + 'T00:00:00')
       const lastFriday = new Date(fridays[fridays.length - 1] + 'T00:00:00')
       const startDate = new Date(firstFriday)
@@ -155,17 +171,15 @@ export default function RentTracker() {
         return
       }
 
-      // Match senders to tenants
-      const matches = matchZellePayments(data.payments, TENANTS)
+      const matches = matchZellePayments(data.payments, activeTenants)
       setZelleMatches(matches)
     } catch (err) {
       setZelleError('Error scanning Gmail: ' + (err as Error).message)
     } finally {
       setZelleLoading(false)
     }
-  }, [monthKey])
+  }, [monthKey, activeTenants])
 
-  // Apply approved Zelle matches to the month
   const handleApplyZelleMatches = useCallback(() => {
     if (!zelleMatches) return
     const approved = zelleMatches.filter(m => m.tenant !== null)
@@ -174,17 +188,16 @@ export default function RentTracker() {
     setShowZelleModal(false)
   }, [zelleMatches])
 
-  // Manually assign a tenant to a Zelle payment that didn't auto-match
   const handleAssignZelleTenant = useCallback((messageId: string, tenantId: string) => {
     setZelleMatches(prev => {
       if (!prev) return prev
       return prev.map(m => {
         if (m.payment.messageId !== messageId) return m
-        const tenant = TENANTS.find(t => t.id === tenantId) || null
+        const tenant = activeTenants.find(t => t.id === tenantId) || null
         return { ...m, tenant, matchMethod: tenant ? 'exact' : 'none', confidence: tenant ? 1.0 : 0 }
       })
     })
-  }, [])
+  }, [activeTenants])
 
   const handleDisconnectGmail = useCallback(async () => {
     await fetch('/api/auth/google/logout', { method: 'POST' })
@@ -203,7 +216,6 @@ export default function RentTracker() {
     setShowCheckModal(true)
 
     try {
-      // Convert files to base64
       const images: Array<{ base64: string; mimeType: string; fileName: string }> = []
 
       for (let i = 0; i < files.length; i++) {
@@ -212,7 +224,6 @@ export default function RentTracker() {
           const reader = new FileReader()
           reader.onload = () => {
             const result = reader.result as string
-            // Strip data:image/xxx;base64, prefix
             resolve(result.split(',')[1])
           }
           reader.onerror = reject
@@ -244,15 +255,15 @@ export default function RentTracker() {
       setCheckError('Error scanning checks: ' + (err as Error).message)
     } finally {
       setCheckScanning(false)
-      // Reset file input
       if (checkInputRef.current) checkInputRef.current.value = ''
     }
   }, [])
 
-  // Apply scanned/edited check data to the month (supports multi-week payments)
+  // Apply scanned/edited check data to the month (supports multi-week payments + credits)
   const handleApplyChecks = useCallback(() => {
     if (!checkResults) return
     const fridays = Object.keys(monthData.weeks).sort()
+    let newCredits = { ...credits }
 
     setMonthData(prev => {
       const newWeeks = { ...prev.weeks }
@@ -270,15 +281,13 @@ export default function RentTracker() {
 
           if (!suiteNum || isNaN(totalAmount) || totalAmount <= 0) continue
 
-          // Find tenant by suite number
-          const tenant = TENANTS.find(t =>
+          const tenant = activeTenants.find(t =>
             t.suiteNumber === suiteNum ||
             t.suiteNumber.includes(suiteNum) ||
             suiteNum.includes(t.suiteNumber)
           )
           if (!tenant) continue
 
-          // Multi-week: use fridayKeys[] if present, otherwise fall back to single fridayKey
           const selectedWeeks = edits.fridayKeys && edits.fridayKeys.length > 0
             ? edits.fridayKeys
             : [edits.fridayKey || (activeTab !== 'monthly-summary' ? activeTab : fridays[0])]
@@ -293,7 +302,6 @@ export default function RentTracker() {
             const idx = entries.findIndex(e => e.tenant.id === tenant.id)
             if (idx === -1) continue
 
-            // Apply up to weeklyRent per week (or remaining if less)
             const applyAmount = Math.min(remaining, weeklyRent)
             remaining -= applyAmount
 
@@ -308,18 +316,23 @@ export default function RentTracker() {
             }
             newWeeks[targetFriday] = entries
           }
+
+          // If there's leftover after applying to all selected weeks, store as credit
+          if (remaining > 0.01) {
+            newCredits = addCredit(newCredits, tenant.id, remaining)
+          }
         }
       }
 
       return { ...prev, weeks: newWeeks }
     })
 
+    setCredits(newCredits)
     setShowCheckModal(false)
     setCheckResults(null)
     setCheckEdits({})
-  }, [checkResults, checkEdits, monthData, activeTab])
+  }, [checkResults, checkEdits, monthData, activeTab, credits, activeTenants])
 
-  // Update an edit override for a scanned check entry (key = "imageIndex-entryIndex")
   const updateCheckEdit = useCallback((editKey: string, field: string, value: string) => {
     setCheckEdits(prev => ({
       ...prev,
@@ -331,7 +344,6 @@ export default function RentTracker() {
     if (activeTab === 'monthly-summary' || !activeTab) return []
     const entries = monthData.weeks[activeTab] || []
 
-    // Auto-mark unpaid entries as "late" if the current date is past the week's Friday
     const today = new Date()
     today.setHours(0, 0, 0, 0)
     const [y, m, d] = activeTab.split('-').map(Number)
@@ -400,7 +412,6 @@ export default function RentTracker() {
   }, [activeTab])
 
   const updatePhone = useCallback((tenantId: string, phone: string) => {
-    // Apply to ALL weeks in current month so phone is consistent
     setMonthData(prev => {
       const newWeeks: Record<string, MonthTenantEntry[]> = {}
       for (const [friday, entries] of Object.entries(prev.weeks)) {
@@ -440,7 +451,7 @@ export default function RentTracker() {
     }
   }, [currentWeekEntries])
 
-  // CSV upload — parses whole month at once
+  // CSV upload
   const handleCSVFileSelect = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
     if (!file) return
@@ -449,21 +460,18 @@ export default function RentTracker() {
     reader.onload = (event) => {
       const text = event.target?.result as string
       try {
-        const result = parseAndMatchCSV(text, TENANTS)
+        const result = parseAndMatchCSV(text, activeTenants)
         setImportResult(result)
-
-        // If the CSV contains months we don't have, still apply to current month's weeks
-        // If it contains a different month, offer to switch? For now, apply to current month.
-        setMonthData(prev => mergeCSVIntoMonth(prev, result.matched, TENANTS))
+        setMonthData(prev => mergeCSVIntoMonth(prev, result.matched, activeTenants))
       } catch (err) {
         alert('Error parsing CSV: ' + (err as Error).message)
       }
     }
     reader.readAsText(file)
     if (fileInputRef.current) fileInputRef.current.value = ''
-  }, [])
+  }, [activeTenants])
 
-  // PDF export — uses current active week
+  // PDF export
   const handleExportPDF = useCallback(() => {
     if (activeTab === 'monthly-summary' || !activeTab) return
     const weekLabel = fridayFullLabel(activeTab)
@@ -487,7 +495,7 @@ export default function RentTracker() {
   })
 
   // Multi-week detection for manual entry
-  const manualTenant = TENANTS.find(t => t.id === manualForm.tenantId)
+  const manualTenant = activeTenants.find(t => t.id === manualForm.tenantId)
   const manualAmount = parseFloat(manualForm.amount) || 0
   const manualIsMultiWeek = manualTenant && manualTenant.weeklyRent > 0 && manualAmount > manualTenant.weeklyRent
   const manualWeeksCount = manualTenant && manualTenant.weeklyRent > 0 ? Math.floor(manualAmount / manualTenant.weeklyRent) : 0
@@ -501,15 +509,27 @@ export default function RentTracker() {
     const confirmation =
       ['Zelle', 'Cash', 'Check', 'Money Order'].includes(manualForm.paymentType) ? 'Cash' : 'Card Processed'
 
-    const tenant = TENANTS.find(t => t.id === manualForm.tenantId)
+    const tenant = activeTenants.find(t => t.id === manualForm.tenantId)
     const weeklyRent = tenant?.weeklyRent || 0
+
+    // Check for existing credit to prompt
+    const existingCredit = getTenantCredit(credits, manualForm.tenantId)
+    if (existingCredit > 0 && !creditPrompt) {
+      setCreditPrompt({
+        tenantId: manualForm.tenantId,
+        creditAmount: existingCredit,
+        paymentContext: 'manual',
+      })
+      return
+    }
 
     // Multi-week: apply across selected weeks
     if (manualForm.multiWeekKeys.length > 1 && weeklyRent > 0) {
       const fridays = Object.keys(monthData.weeks).sort()
+      let remaining = amount
+
       setMonthData(prev => {
         const newWeeks = { ...prev.weeks }
-        let remaining = amount
 
         for (const fridayKey of manualForm.multiWeekKeys) {
           if (!newWeeks[fridayKey] || !fridays.includes(fridayKey)) continue
@@ -534,8 +554,15 @@ export default function RentTracker() {
         }
         return { ...prev, weeks: newWeeks }
       })
+
+      // Store any leftover as credit
+      const totalApplied = manualForm.multiWeekKeys.length * weeklyRent
+      const leftover = amount - totalApplied
+      if (leftover > 0.01) {
+        setCredits(prev => addCredit(prev, manualForm.tenantId, leftover))
+      }
     } else {
-      // Single-week: apply to current week (original behavior)
+      // Single-week
       const entry = currentWeekEntries.find(e => e.tenant.id === manualForm.tenantId)
       updateEntry(manualForm.tenantId, {
         amountPaid: amount,
@@ -544,12 +571,41 @@ export default function RentTracker() {
         checkNumber: manualForm.checkNumber || undefined,
         notes: manualForm.notes || undefined,
         confirmation,
-      }, true) // markManual = true
+      }, true)
     }
 
+    setCreditPrompt(null)
     setManualForm({ tenantId: '', amount: '', paymentType: 'Zelle', checkNumber: '', notes: '', multiWeekKeys: [] })
     setShowManualEntry(false)
-  }, [manualForm, currentWeekEntries, updateEntry, monthData])
+  }, [manualForm, currentWeekEntries, updateEntry, monthData, credits, creditPrompt, activeTenants])
+
+  // Apply credit to a payment
+  const handleApplyCredit = useCallback((tenantId: string) => {
+    const creditAmt = getTenantCredit(credits, tenantId)
+    if (creditAmt <= 0) return
+
+    // Apply credit to current week
+    if (activeTab && activeTab !== 'monthly-summary') {
+      const entry = currentWeekEntries.find(e => e.tenant.id === tenantId)
+      if (entry) {
+        const owed = entry.amountDue - entry.amountPaid
+        const applyAmt = Math.min(creditAmt, owed)
+        if (applyAmt > 0) {
+          updateEntry(tenantId, {
+            amountPaid: entry.amountPaid + applyAmt,
+            status: (entry.amountPaid + applyAmt) >= entry.amountDue ? 'paid' : 'partial',
+          }, true)
+          setCredits(prev => useCredit(prev, tenantId, applyAmt))
+        }
+      }
+    }
+    setCreditPrompt(null)
+  }, [credits, activeTab, currentWeekEntries, updateEntry])
+
+  // Dismiss credit prompt and proceed without applying
+  const handleSkipCredit = useCallback(() => {
+    setCreditPrompt(null)
+  }, [])
 
   // SMS reminders
   const getLateTenants = useCallback(() => {
@@ -608,8 +664,136 @@ export default function RentTracker() {
     }
   }, [getLateTenants, smsSentThisWeek])
 
+  // ---- Tenant Management Handlers ----
+  const handleOpenAddTenant = useCallback((suiteNumber: string) => {
+    setTenantPanelMode('add')
+    setSelectedTenantId(null)
+    setTenantPanelSuite(suiteNumber)
+    setShowTenantPanel(true)
+  }, [])
+
+  const handleOpenEditTenant = useCallback((tenantId: string) => {
+    setTenantPanelMode('edit')
+    setSelectedTenantId(tenantId)
+    const t = tenants.find(x => x.id === tenantId)
+    setTenantPanelSuite(t?.suiteNumber || '')
+    setShowTenantPanel(true)
+  }, [tenants])
+
+  const handleSaveTenant = useCallback((data: TenantFormData) => {
+    if (tenantPanelMode === 'add') {
+      const updated = createTenant(tenants, data)
+      setTenants(updated)
+      // Rebuild month data to include new tenant
+      const newMonthData = createEmptyMonth(monthKey, getActiveTenants(updated))
+      // Merge existing payment data
+      const mergedWeeks: Record<string, MonthTenantEntry[]> = {}
+      for (const [friday, entries] of Object.entries(newMonthData.weeks)) {
+        const existingEntries = monthData.weeks[friday] || []
+        mergedWeeks[friday] = entries.map(newEntry => {
+          const existing = existingEntries.find(e => e.tenant.id === newEntry.tenant.id)
+          return existing || newEntry
+        })
+      }
+      setMonthData(prev => ({ ...prev, weeks: mergedWeeks }))
+    } else if (selectedTenantId) {
+      const updated = updateTenant(tenants, selectedTenantId, data)
+      setTenants(updated)
+      // Update tenant data in month entries
+      setMonthData(prev => {
+        const newWeeks: Record<string, MonthTenantEntry[]> = {}
+        for (const [friday, entries] of Object.entries(prev.weeks)) {
+          newWeeks[friday] = entries.map(e => {
+            if (e.tenant.id !== selectedTenantId) return e
+            const updatedTenant = updated.find(t => t.id === selectedTenantId)
+            return updatedTenant ? { ...e, tenant: updatedTenant } : e
+          })
+        }
+        return { ...prev, weeks: newWeeks }
+      })
+    }
+    setShowTenantPanel(false)
+  }, [tenantPanelMode, selectedTenantId, tenants, monthKey, monthData])
+
+  const handleMoveOutTenant = useCallback((tenantId: string) => {
+    if (!moveOutDate) return
+    const updated = archiveTenant(tenants, tenantId, moveOutDate)
+    setTenants(updated)
+
+    // Update month data: mark the archived tenant's future weeks, add vacant
+    setMonthData(prev => {
+      const newWeeks: Record<string, MonthTenantEntry[]> = {}
+      const archivedT = updated.find(t => t.id === tenantId)
+      const vacantT = updated.find(t => t.suiteNumber === archivedT?.suiteNumber && !t.isArchived && !t.isActive)
+
+      for (const [friday, entries] of Object.entries(prev.weeks)) {
+        let weekEntries = entries.map(e => {
+          if (e.tenant.id === tenantId) {
+            // Keep payment data intact for past weeks
+            const fridayDate = new Date(friday + 'T00:00:00')
+            const moveDate = new Date(moveOutDate + 'T00:00:00')
+            if (fridayDate > moveDate) {
+              // Future weeks: mark as vacant
+              return vacantT ? {
+                ...e,
+                tenant: vacantT,
+                isVacant: true,
+                status: 'unpaid' as WeekStatus,
+                amountPaid: 0,
+                amountDue: 0,
+                paymentType: undefined,
+                paymentSource: 'none' as const,
+              } : e
+            }
+          }
+          return e
+        })
+        newWeeks[friday] = weekEntries
+      }
+      return { ...prev, weeks: newWeeks }
+    })
+
+    setShowMoveOutConfirm(null)
+    setMoveOutDate('')
+  }, [tenants, moveOutDate])
+
   const sortedFridays = useMemo(() => Object.keys(monthData.weeks).sort(), [monthData.weeks])
   const isMonthlySummaryTab = activeTab === 'monthly-summary'
+
+  // Check if all multi-week entries in checks are fully allocated
+  const allCheckMultiWeeksAllocated = useMemo(() => {
+    if (!checkResults) return true
+    for (const result of checkResults) {
+      for (let entryIdx = 0; entryIdx < result.entries.length; entryIdx++) {
+        const entry = result.entries[entryIdx]
+        const editKey = `${result.imageIndex}-${entryIdx}`
+        const edits = checkEdits[editKey] || {}
+        const suite = edits.suiteNumber ?? entry.suiteNumber
+        const amount = edits.amount ?? (entry.amount != null ? String(entry.amount) : '')
+        const amountVal = parseFloat(amount) || 0
+
+        if (!suite || amountVal <= 0) continue
+
+        const matchedTenant = activeTenants.find(t =>
+          t.suiteNumber === suite ||
+          t.suiteNumber.includes(suite) ||
+          (suite && suite.includes(t.suiteNumber))
+        )
+        if (!matchedTenant) continue
+
+        const weeklyRent = matchedTenant.weeklyRent
+        if (weeklyRent > 0 && amountVal > weeklyRent) {
+          const weeksNeeded = Math.floor(amountVal / weeklyRent)
+          const selectedKeys = edits.fridayKeys || []
+          if (selectedKeys.length !== weeksNeeded) return false
+        }
+      }
+    }
+    return true
+  }, [checkResults, checkEdits, activeTenants])
+
+  // Manual entry: check if multi-week is fully allocated
+  const manualMultiWeekAllocated = !manualIsMultiWeek || manualForm.multiWeekKeys.length === manualWeeksCount
 
   return (
     <div className="min-h-screen bg-gray-50">
@@ -646,18 +830,16 @@ export default function RentTracker() {
             <button
               onClick={() => fileInputRef.current?.click()}
               className="px-3 py-1.5 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700 flex items-center gap-1.5"
-              title="Upload monthly TenantCloud CSV — auto-distributes payments across weeks"
+              title="Upload monthly TenantCloud CSV"
             >
               {monthData.lastCSVUpload ? <RefreshCw size={14} /> : <Upload size={14} />}
               {monthData.lastCSVUpload ? 'Refresh CSV' : 'Import CSV'}
             </button>
 
-            {/* Gmail / Zelle button */}
             {gmailConnected ? (
               <button
                 onClick={() => { setShowZelleModal(true); setZelleMatches(null); setZelleError(null) }}
                 className="px-3 py-1.5 bg-violet-600 text-white text-sm font-medium rounded-lg hover:bg-violet-700 flex items-center gap-1.5"
-                title="Scan Gmail for Chase Zelle notifications"
               >
                 <Mail size={14} /> Scan Zelle
               </button>
@@ -665,12 +847,10 @@ export default function RentTracker() {
               <a
                 href="/api/auth/google"
                 className="px-3 py-1.5 bg-white text-gray-700 text-sm font-medium rounded-lg border border-gray-300 hover:bg-gray-50 flex items-center gap-1.5"
-                title="Connect your Gmail to scan for Chase Zelle notifications"
               >
                 <Mail size={14} /> Connect Gmail
               </a>
             )}
-            {/* Check scanning */}
             <input
               ref={checkInputRef}
               type="file"
@@ -682,7 +862,6 @@ export default function RentTracker() {
             <button
               onClick={() => checkInputRef.current?.click()}
               className="px-3 py-1.5 bg-amber-600 text-white text-sm font-medium rounded-lg hover:bg-amber-700 flex items-center gap-1.5"
-              title="Upload photos of check deposit slips to scan"
             >
               <Camera size={14} /> Scan Checks
             </button>
@@ -707,6 +886,14 @@ export default function RentTracker() {
                   <FileDown size={14} /> PDF
                 </button>
               </>
+            )}
+            {archivedTenants.length > 0 && (
+              <button
+                onClick={() => setShowPastTenants(true)}
+                className="px-3 py-1.5 bg-gray-100 text-gray-600 text-sm font-medium rounded-lg border border-gray-200 hover:bg-gray-200 flex items-center gap-1.5"
+              >
+                <Archive size={14} /> Past Tenants
+              </button>
             )}
           </div>
         </div>
@@ -804,6 +991,7 @@ export default function RentTracker() {
                       <Th className="w-20 text-center">Chk #</Th>
                       <Th className="w-28">Phone</Th>
                       <Th>Notes</Th>
+                      <Th className="w-16"></Th>
                     </tr>
                   </thead>
                   <tbody>
@@ -811,12 +999,17 @@ export default function RentTracker() {
                       <EntryRow
                         key={entry.tenant.id}
                         entry={entry}
+                        credit={getTenantCredit(credits, entry.tenant.id)}
                         onUpdate={updateEntry}
                         onFrequencyChange={updateFrequency}
                         onPhoneChange={updatePhone}
                         isEditing={editingCell === entry.tenant.id}
                         onStartEdit={() => setEditingCell(entry.tenant.id)}
                         onStopEdit={() => setEditingCell(null)}
+                        onAddTenant={handleOpenAddTenant}
+                        onEditTenant={handleOpenEditTenant}
+                        onMoveOutTenant={(id) => { setShowMoveOutConfirm(id); setMoveOutDate('') }}
+                        onApplyCredit={handleApplyCredit}
                       />
                     ))}
                   </tbody>
@@ -825,7 +1018,7 @@ export default function RentTracker() {
                       <td colSpan={3} className="px-3 py-2 text-sm font-bold text-gray-700 text-right">Totals:</td>
                       <td className="px-3 py-2 text-sm font-bold text-gray-900 text-right font-mono">{formatCurrency(stats.totalDue)}</td>
                       <td className="px-3 py-2 text-sm font-bold text-green-700 text-right font-mono">{formatCurrency(stats.totalPaid)}</td>
-                      <td colSpan={6}></td>
+                      <td colSpan={7}></td>
                     </tr>
                   </tfoot>
                 </table>
@@ -837,19 +1030,46 @@ export default function RentTracker() {
 
       {/* Manual Entry Modal */}
       {showManualEntry && (
-        <Modal onClose={() => setShowManualEntry(false)} title={`Add Manual Payment — ${fridayFullLabel(activeTab as string)}`}>
+        <Modal onClose={() => { setShowManualEntry(false); setCreditPrompt(null) }} title={`Add Manual Payment — ${fridayFullLabel(activeTab as string)}`}>
           <div className="space-y-3">
+            {/* Credit prompt */}
+            {creditPrompt && (
+              <div className="bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2">
+                <div className="flex items-center justify-between">
+                  <div className="text-sm text-emerald-800">
+                    <Wallet size={14} className="inline mr-1.5 -mt-0.5" />
+                    <strong>{formatCurrency(creditPrompt.creditAmount)}</strong> credit on file
+                  </div>
+                  <div className="flex gap-2">
+                    <button
+                      onClick={() => handleApplyCredit(creditPrompt.tenantId)}
+                      className="px-2.5 py-1 bg-emerald-600 text-white text-xs font-medium rounded hover:bg-emerald-700"
+                    >
+                      Apply Credit
+                    </button>
+                    <button
+                      onClick={handleSkipCredit}
+                      className="px-2.5 py-1 text-emerald-600 text-xs font-medium hover:text-emerald-800"
+                    >
+                      Skip
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-1">Tenant</label>
               <select
                 value={manualForm.tenantId}
-                onChange={e => setManualForm(f => ({ ...f, tenantId: e.target.value }))}
+                onChange={e => { setManualForm(f => ({ ...f, tenantId: e.target.value })); setCreditPrompt(null) }}
                 className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
               >
                 <option value="">Select tenant...</option>
                 {currentWeekEntries.filter(e => !e.isVacant).map(e => (
                   <option key={e.tenant.id} value={e.tenant.id}>
                     {e.tenant.suiteNumber} — {e.tenant.name} ({formatCurrency(e.tenant.weeklyRent)})
+                    {getTenantCredit(credits, e.tenant.id) > 0 ? ` [${formatCurrency(getTenantCredit(credits, e.tenant.id))} credit]` : ''}
                   </option>
                 ))}
               </select>
@@ -894,10 +1114,11 @@ export default function RentTracker() {
                 <div className="border border-purple-200 bg-purple-50 rounded-lg px-3 py-2">
                   <div className="flex items-center justify-between mb-2">
                     <span className="text-xs font-semibold text-purple-700">
-                      Covers {manualWeeksCount} week{manualWeeksCount !== 1 ? 's' : ''} at {formatCurrency(manualTenant!.weeklyRent)}/wk
+                      {formatCurrency(manualAmount)} = {manualWeeksCount} week{manualWeeksCount !== 1 ? 's' : ''} at {formatCurrency(manualTenant!.weeklyRent)}/wk
                       {manualCreditAmount > 0 && (
-                        <span className="text-amber-600 ml-1">+ {formatCurrency(manualCreditAmount)} credit</span>
+                        <span className="text-amber-600 ml-1">(+{formatCurrency(manualCreditAmount)} credit)</span>
                       )}
+                      {manualCreditAmount === 0 && <span className="text-green-600 ml-1">(no credit)</span>}
                     </span>
                     <span className={cn(
                       'text-[10px] px-1.5 py-0.5 rounded font-medium',
@@ -905,7 +1126,7 @@ export default function RentTracker() {
                       manualForm.multiWeekKeys.length > 0 ? 'bg-amber-100 text-amber-700' :
                       'bg-gray-100 text-gray-500'
                     )}>
-                      {manualForm.multiWeekKeys.length} of {manualWeeksCount} selected
+                      Selected: {manualForm.multiWeekKeys.length} of {manualWeeksCount} weeks
                     </span>
                   </div>
                   <p className="text-[10px] text-purple-600 mb-2">Select which weeks to apply this payment to:</p>
@@ -952,12 +1173,12 @@ export default function RentTracker() {
             <div className="flex gap-2 pt-2">
               <button
                 onClick={handleManualAdd}
-                disabled={!manualForm.tenantId || !manualForm.amount}
+                disabled={!manualForm.tenantId || !manualForm.amount || !manualMultiWeekAllocated}
                 className="flex-1 px-4 py-2 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 Add Payment
               </button>
-              <button onClick={() => setShowManualEntry(false)} className="px-4 py-2 text-gray-600 text-sm hover:text-gray-800">Cancel</button>
+              <button onClick={() => { setShowManualEntry(false); setCreditPrompt(null) }} className="px-4 py-2 text-gray-600 text-sm hover:text-gray-800">Cancel</button>
             </div>
           </div>
         </Modal>
@@ -970,7 +1191,6 @@ export default function RentTracker() {
           title={`Import Zelle from Gmail — ${monthLabel(monthKey)}`}
         >
           <div className="space-y-4">
-            {/* Gmail connection banner */}
             <div className="flex items-center justify-between bg-violet-50 border border-violet-200 rounded-lg px-3 py-2">
               <div className="flex items-center gap-2 text-sm text-violet-800">
                 <CheckCircle2 size={14} className="text-violet-600" />
@@ -987,11 +1207,10 @@ export default function RentTracker() {
               </div>
             )}
 
-            {/* Initial state: scan button */}
             {!zelleMatches && (
               <div className="text-center py-6 space-y-3">
                 <p className="text-sm text-gray-600">
-                  Scan your Gmail for Chase Zelle notifications received during {monthLabel(monthKey)}. This will only read Chase Zelle emails.
+                  Scan your Gmail for Chase Zelle notifications received during {monthLabel(monthKey)}.
                 </p>
                 <button
                   onClick={handleScanZelle}
@@ -1003,18 +1222,17 @@ export default function RentTracker() {
               </div>
             )}
 
-            {/* Results */}
             {zelleMatches && (
               <div className="space-y-3">
                 <div className="text-sm text-gray-700">
-                  Found <strong>{zelleMatches.length}</strong> Zelle payment{zelleMatches.length !== 1 ? 's' : ''} in Gmail.
+                  Found <strong>{zelleMatches.length}</strong> Zelle payment{zelleMatches.length !== 1 ? 's' : ''}.
                   {zelleMatches.filter(m => m.tenant).length > 0 && (
-                    <> <strong className="text-green-700">{zelleMatches.filter(m => m.tenant).length}</strong> auto-matched to tenants.</>
+                    <> <strong className="text-green-700">{zelleMatches.filter(m => m.tenant).length}</strong> auto-matched.</>
                   )}
                 </div>
 
                 <div className="max-h-80 overflow-y-auto space-y-2">
-                  {zelleMatches.map((match, i) => {
+                  {zelleMatches.map((match) => {
                     const friday = match.payment.assignedFriday
                     const isUnmatched = !match.tenant
                     return (
@@ -1044,7 +1262,7 @@ export default function RentTracker() {
                             className="flex-1 text-xs border border-gray-300 rounded px-2 py-1 bg-white"
                           >
                             <option value="">— Skip this payment —</option>
-                            {TENANTS.filter(t => t.isActive).map(t => (
+                            {activeTenants.filter(t => t.isActive).map(t => (
                               <option key={t.id} value={t.id}>
                                 {t.suiteNumber} — {t.name}
                               </option>
@@ -1142,11 +1360,13 @@ export default function RentTracker() {
           </div>
         </Modal>
       )}
+
       {/* Check Scan Modal */}
       {showCheckModal && (
         <Modal
           onClose={() => { setShowCheckModal(false); setCheckResults(null); setCheckError(null); setCheckEdits({}) }}
           title="Scan Check Deposit Slips"
+          wide
         >
           <div className="space-y-4">
             {checkError && (
@@ -1155,7 +1375,6 @@ export default function RentTracker() {
               </div>
             )}
 
-            {/* Scanning in progress */}
             {checkScanning && (
               <div className="text-center py-8 space-y-3">
                 <Loader2 size={28} className="animate-spin mx-auto text-amber-600" />
@@ -1164,7 +1383,6 @@ export default function RentTracker() {
               </div>
             )}
 
-            {/* Results */}
             {checkResults && !checkScanning && (() => {
               const totalEntries = checkResults.reduce((sum, r) => sum + r.entries.length, 0)
               const validEntries: Array<{ imageIdx: number; entryIdx: number }> = []
@@ -1188,7 +1406,6 @@ export default function RentTracker() {
                 <div className="max-h-[450px] overflow-y-auto space-y-4">
                   {checkResults.map((result) => (
                     <div key={result.imageIndex} className="space-y-2">
-                      {/* Deposit slip header */}
                       <div className="flex items-center gap-2 border-b pb-1">
                         <Image size={14} className="text-gray-400" />
                         <span className="font-medium text-gray-700 text-xs">{result.fileName}</span>
@@ -1209,7 +1426,7 @@ export default function RentTracker() {
                           const fridayKey = edits.fridayKey || (activeTab !== 'monthly-summary' ? activeTab : '')
                           const sortedFri = Object.keys(monthData.weeks).sort()
 
-                          const matchedTenant = TENANTS.find(t =>
+                          const matchedTenant = activeTenants.find(t =>
                             t.suiteNumber === suite ||
                             t.suiteNumber.includes(suite) ||
                             (suite && suite.includes(t.suiteNumber))
@@ -1295,10 +1512,11 @@ export default function RentTracker() {
                                 <div className="mt-2 border-t pt-2">
                                   <div className="flex items-center justify-between mb-1.5">
                                     <span className="text-[10px] font-semibold text-purple-700 uppercase">
-                                      Covers {weeksCount} week{weeksCount !== 1 ? 's' : ''} at {formatCurrency(weeklyRent)}/wk
+                                      {formatCurrency(amountVal)} = {weeksCount} week{weeksCount !== 1 ? 's' : ''} at {formatCurrency(weeklyRent)}/wk
                                       {creditAmount > 0 && (
-                                        <span className="text-amber-600 ml-1">+ {formatCurrency(creditAmount)} credit</span>
+                                        <span className="text-amber-600 ml-1">(+{formatCurrency(creditAmount)} credit)</span>
                                       )}
+                                      {creditAmount === 0 && <span className="text-green-600 ml-1">(no credit)</span>}
                                     </span>
                                     <span className={cn(
                                       'text-[10px] px-1.5 py-0.5 rounded font-medium',
@@ -1306,7 +1524,7 @@ export default function RentTracker() {
                                       selectedFridayKeys.length > 0 ? 'bg-amber-100 text-amber-700' :
                                       'bg-gray-100 text-gray-500'
                                     )}>
-                                      {selectedFridayKeys.length} of {weeksCount} selected
+                                      Selected: {selectedFridayKeys.length} of {weeksCount} weeks
                                     </span>
                                   </div>
                                   <div className="flex flex-wrap gap-1.5">
@@ -1365,10 +1583,13 @@ export default function RentTracker() {
                 <div className="flex gap-2 pt-2">
                   <button
                     onClick={handleApplyChecks}
-                    disabled={validEntries.length === 0}
+                    disabled={validEntries.length === 0 || !allCheckMultiWeeksAllocated}
                     className="flex-1 px-4 py-2 bg-amber-600 text-white text-sm font-medium rounded-lg hover:bg-amber-700 disabled:opacity-50 disabled:cursor-not-allowed"
                   >
-                    Apply {validEntries.length} Check{validEntries.length !== 1 ? 's' : ''}
+                    {!allCheckMultiWeeksAllocated
+                      ? 'Select weeks for all multi-week entries'
+                      : `Apply ${validEntries.length} Check${validEntries.length !== 1 ? 's' : ''}`
+                    }
                   </button>
                   <button
                     onClick={() => checkInputRef.current?.click()}
@@ -1381,7 +1602,6 @@ export default function RentTracker() {
               )
             })()}
 
-            {/* Empty state — not scanning, no results */}
             {!checkScanning && !checkResults && !checkError && (
               <div className="text-center py-8 space-y-3">
                 <Camera size={32} className="mx-auto text-gray-300" />
@@ -1398,6 +1618,356 @@ export default function RentTracker() {
           </div>
         </Modal>
       )}
+
+      {/* Move Out Confirmation Modal */}
+      {showMoveOutConfirm && (() => {
+        const tenant = tenants.find(t => t.id === showMoveOutConfirm)
+        if (!tenant) return null
+        return (
+          <Modal onClose={() => setShowMoveOutConfirm(null)} title={`Move Out — ${tenant.name}`}>
+            <div className="space-y-4">
+              <p className="text-sm text-gray-600">
+                This will archive <strong>{tenant.name}</strong> (Suite {tenant.suiteNumber}) and mark the suite as Vacant.
+                All past payment records will be preserved for your reports.
+              </p>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">Last Day</label>
+                <input
+                  type="date"
+                  value={moveOutDate}
+                  onChange={e => setMoveOutDate(e.target.value)}
+                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                />
+              </div>
+              <div className="flex gap-2 pt-2">
+                <button
+                  onClick={() => handleMoveOutTenant(showMoveOutConfirm)}
+                  disabled={!moveOutDate}
+                  className="flex-1 px-4 py-2 bg-red-600 text-white text-sm font-medium rounded-lg hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+                >
+                  <DoorOpen size={14} /> Confirm Move Out
+                </button>
+                <button onClick={() => setShowMoveOutConfirm(null)} className="px-4 py-2 text-gray-600 text-sm hover:text-gray-800">Cancel</button>
+              </div>
+            </div>
+          </Modal>
+        )
+      })()}
+
+      {/* Past Tenants Modal */}
+      {showPastTenants && (
+        <Modal onClose={() => setShowPastTenants(false)} title="Past Tenants" wide>
+          <div className="space-y-3">
+            {archivedTenants.length === 0 ? (
+              <p className="text-sm text-gray-500 text-center py-4">No archived tenants yet.</p>
+            ) : (
+              <div className="max-h-96 overflow-y-auto space-y-2">
+                {archivedTenants.map(t => (
+                  <div key={t.id} className="border border-gray-200 rounded-lg px-4 py-3 bg-gray-50">
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <span className="text-sm font-medium text-gray-900">{t.name}</span>
+                        <span className="text-xs text-gray-500 ml-2">Suite {t.suiteNumber}</span>
+                      </div>
+                      <span className="text-xs text-gray-400 bg-gray-100 px-2 py-0.5 rounded">
+                        Moved out {t.movedOutDate || 'N/A'}
+                      </span>
+                    </div>
+                    <div className="mt-1 text-xs text-gray-500 flex gap-4">
+                      <span>Rent: {formatCurrency(t.weeklyRent)}/{t.billingFrequency}</span>
+                      {t.moveInDate && <span>Move-in: {t.moveInDate}</span>}
+                      {t.phone && <span>Phone: {t.phone}</span>}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+            <button onClick={() => setShowPastTenants(false)} className="w-full px-4 py-2 bg-gray-100 text-gray-700 text-sm font-medium rounded-lg hover:bg-gray-200">Close</button>
+          </div>
+        </Modal>
+      )}
+
+      {/* Tenant Add/Edit Slide-out Panel */}
+      {showTenantPanel && (
+        <TenantPanel
+          mode={tenantPanelMode}
+          suiteNumber={tenantPanelSuite}
+          tenant={selectedTenantId ? tenants.find(t => t.id === selectedTenantId) : undefined}
+          onSave={handleSaveTenant}
+          onClose={() => setShowTenantPanel(false)}
+        />
+      )}
+    </div>
+  )
+}
+
+// ---- Tenant Add/Edit Panel (Slide-out) ----
+
+function TenantPanel({
+  mode,
+  suiteNumber,
+  tenant,
+  onSave,
+  onClose,
+}: {
+  mode: 'add' | 'edit'
+  suiteNumber: string
+  tenant?: Tenant
+  onSave: (data: TenantFormData) => void
+  onClose: () => void
+}) {
+  const [showDetails, setShowDetails] = useState(false)
+  const [showSecondName, setShowSecondName] = useState(!!tenant?.secondName)
+  const [form, setForm] = useState({
+    name: tenant ? (tenant.secondName ? tenant.name.split(' & ')[0] : tenant.name) : '',
+    secondName: tenant?.secondName || '',
+    suiteNumber: suiteNumber,
+    weeklyRent: tenant?.weeklyRent?.toString() || '',
+    billingFrequency: (tenant?.billingFrequency || 'weekly') as BillingFrequency,
+    defaultPayType: (tenant?.defaultPayType || '') as PaymentType | '',
+    moveInDate: tenant?.moveInDate || '',
+    phone: tenant?.phone || '',
+    email: tenant?.email || '',
+    securityDeposit: tenant?.securityDeposit?.toString() || '',
+    leaseEnd: tenant?.leaseEnd || '',
+    notes: tenant?.notes || '',
+  })
+
+  const handleSubmit = () => {
+    if (!form.name || !form.weeklyRent || !form.moveInDate) return
+    onSave({
+      name: form.name,
+      secondName: showSecondName ? form.secondName : undefined,
+      suiteNumber: form.suiteNumber,
+      weeklyRent: parseFloat(form.weeklyRent),
+      billingFrequency: form.billingFrequency,
+      defaultPayType: form.defaultPayType as PaymentType || undefined,
+      moveInDate: form.moveInDate,
+      phone: form.phone,
+      email: form.email,
+      securityDeposit: form.securityDeposit ? parseFloat(form.securityDeposit) : undefined,
+      leaseEnd: form.leaseEnd,
+      notes: form.notes,
+    })
+  }
+
+  const isValid = form.name && form.weeklyRent && parseFloat(form.weeklyRent) > 0 && form.moveInDate
+
+  return (
+    <div className="fixed inset-0 z-50 flex justify-end">
+      <div className="absolute inset-0 bg-black/30" onClick={onClose} />
+      <div className="relative w-full max-w-md bg-white shadow-xl flex flex-col animate-slide-in">
+        {/* Header */}
+        <div className="flex items-center justify-between px-5 py-4 border-b border-gray-200">
+          <div>
+            <h3 className="text-lg font-semibold text-gray-900">
+              {mode === 'add' ? 'Add Tenant' : 'Edit Tenant'}
+            </h3>
+            <p className="text-xs text-gray-500">Suite {form.suiteNumber}</p>
+          </div>
+          <button onClick={onClose} className="p-1.5 text-gray-400 hover:text-gray-600 rounded-lg hover:bg-gray-100">
+            <X size={20} />
+          </button>
+        </div>
+
+        {/* Form */}
+        <div className="flex-1 overflow-y-auto px-5 py-4 space-y-4">
+          {/* Name */}
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              Tenant Name <span className="text-red-500">*</span>
+            </label>
+            <input
+              type="text"
+              value={form.name}
+              onChange={e => setForm(f => ({ ...f, name: e.target.value }))}
+              placeholder="e.g. Lauren"
+              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+            />
+            {!showSecondName ? (
+              <button
+                type="button"
+                onClick={() => setShowSecondName(true)}
+                className="text-xs text-blue-600 hover:text-blue-800 mt-1 flex items-center gap-1"
+              >
+                <Plus size={10} /> Add second name (shared suite)
+              </button>
+            ) : (
+              <div className="mt-2">
+                <label className="block text-xs text-gray-500 mb-0.5">Second Tenant Name</label>
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    value={form.secondName}
+                    onChange={e => setForm(f => ({ ...f, secondName: e.target.value }))}
+                    placeholder="e.g. Tonya"
+                    className="flex-1 border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => { setShowSecondName(false); setForm(f => ({ ...f, secondName: '' })) }}
+                    className="text-gray-400 hover:text-red-400 p-1"
+                  >
+                    <X size={16} />
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Suite (auto-filled, read-only for add) */}
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Suite Number</label>
+            <input
+              type="text"
+              value={form.suiteNumber}
+              onChange={e => setForm(f => ({ ...f, suiteNumber: e.target.value }))}
+              readOnly={mode === 'add'}
+              className={cn(
+                'w-full border border-gray-300 rounded-lg px-3 py-2 text-sm',
+                mode === 'add' ? 'bg-gray-50 text-gray-500' : 'focus:ring-2 focus:ring-blue-500 focus:border-blue-500'
+              )}
+            />
+          </div>
+
+          {/* Rent + Frequency */}
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">
+                Rent Amount <span className="text-red-500">*</span>
+              </label>
+              <input
+                type="number" step="0.01"
+                value={form.weeklyRent}
+                onChange={e => setForm(f => ({ ...f, weeklyRent: e.target.value }))}
+                placeholder="0.00"
+                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+              />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">
+                Pay Frequency <span className="text-red-500">*</span>
+              </label>
+              <select
+                value={form.billingFrequency}
+                onChange={e => setForm(f => ({ ...f, billingFrequency: e.target.value as BillingFrequency }))}
+                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+              >
+                {BILLING_FREQUENCIES.map(f => (<option key={f} value={f}>{FREQUENCY_LABELS[f]}</option>))}
+              </select>
+            </div>
+          </div>
+
+          {/* Default Pay Type */}
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Default Payment Type</label>
+            <select
+              value={form.defaultPayType}
+              onChange={e => setForm(f => ({ ...f, defaultPayType: e.target.value as PaymentType }))}
+              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+            >
+              <option value="">None</option>
+              {PAYMENT_TYPES.map(t => (<option key={t} value={t}>{t}</option>))}
+            </select>
+          </div>
+
+          {/* Move-in Date */}
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              Move-in Date <span className="text-red-500">*</span>
+            </label>
+            <input
+              type="date"
+              value={form.moveInDate}
+              onChange={e => setForm(f => ({ ...f, moveInDate: e.target.value }))}
+              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+            />
+          </div>
+
+          {/* Phone */}
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Phone</label>
+            <input
+              type="tel"
+              value={form.phone}
+              onChange={e => setForm(f => ({ ...f, phone: e.target.value }))}
+              placeholder="(555) 123-4567"
+              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+            />
+          </div>
+
+          {/* Security Deposit */}
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Security Deposit</label>
+            <input
+              type="number" step="0.01"
+              value={form.securityDeposit}
+              onChange={e => setForm(f => ({ ...f, securityDeposit: e.target.value }))}
+              placeholder="0.00"
+              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+            />
+          </div>
+
+          {/* Lease End Date */}
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Lease End Date</label>
+            <input
+              type="date"
+              value={form.leaseEnd}
+              onChange={e => setForm(f => ({ ...f, leaseEnd: e.target.value }))}
+              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+            />
+          </div>
+
+          {/* Optional details */}
+          <button
+            type="button"
+            onClick={() => setShowDetails(!showDetails)}
+            className="flex items-center gap-1 text-sm text-gray-500 hover:text-gray-700"
+          >
+            <ChevronDown size={14} className={cn('transition-transform', showDetails && 'rotate-180')} />
+            Optional details
+          </button>
+          {showDetails && (
+            <div className="space-y-3 pl-2 border-l-2 border-gray-100">
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">Email</label>
+                <input
+                  type="email"
+                  value={form.email}
+                  onChange={e => setForm(f => ({ ...f, email: e.target.value }))}
+                  placeholder="tenant@email.com"
+                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">Notes</label>
+                <textarea
+                  value={form.notes}
+                  onChange={e => setForm(f => ({ ...f, notes: e.target.value }))}
+                  rows={3}
+                  placeholder="Any additional details..."
+                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 resize-none"
+                />
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Footer */}
+        <div className="px-5 py-4 border-t border-gray-200 flex gap-2">
+          <button
+            onClick={handleSubmit}
+            disabled={!isValid}
+            className="flex-1 px-4 py-2.5 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+          >
+            {mode === 'add' ? <><UserPlus size={14} /> Add Tenant</> : <><Check size={14} /> Save Changes</>}
+          </button>
+          <button onClick={onClose} className="px-4 py-2.5 text-gray-600 text-sm hover:text-gray-800">
+            Cancel
+          </button>
+        </div>
+      </div>
     </div>
   )
 }
@@ -1409,7 +1979,6 @@ function MonthlySummaryView({ monthData }: { monthData: MonthData }) {
 
   return (
     <div className="space-y-4">
-      {/* Top stat cards */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         <BigStatCard label="Expected" value={formatCurrency(summary.totalExpected)} icon={<TrendingUp size={18} />} color="blue" />
         <BigStatCard label="Collected" value={formatCurrency(summary.totalCollected)} icon={<Check size={18} />} color="green" />
@@ -1417,7 +1986,6 @@ function MonthlySummaryView({ monthData }: { monthData: MonthData }) {
         <BigStatCard label="Collection Rate" value={`${summary.collectionRate.toFixed(1)}%`} icon={<BarChart3 size={18} />} color="purple" />
       </div>
 
-      {/* Week-by-week breakdown */}
       <div className="bg-white rounded-lg border border-gray-200 p-4">
         <h3 className="text-sm font-semibold text-gray-900 mb-3 flex items-center gap-2">
           <Calendar size={16} /> Week-by-Week Performance
@@ -1441,13 +2009,12 @@ function MonthlySummaryView({ monthData }: { monthData: MonthData }) {
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        {/* Chronic late / unpaid */}
         <div className="bg-white rounded-lg border border-gray-200 p-4">
           <h3 className="text-sm font-semibold text-gray-900 mb-3 flex items-center gap-2">
             <AlertCircle size={16} className="text-red-500" /> Problem Tenants
           </h3>
           {summary.repeatUnpaid.length === 0 && summary.chronicLate.length === 0 ? (
-            <p className="text-sm text-gray-500 italic">No late or unpaid tenants this month 🎉</p>
+            <p className="text-sm text-gray-500 italic">No late or unpaid tenants this month</p>
           ) : (
             <div className="space-y-1.5">
               {summary.repeatUnpaid.map(item => (
@@ -1466,7 +2033,6 @@ function MonthlySummaryView({ monthData }: { monthData: MonthData }) {
           )}
         </div>
 
-        {/* Payment method breakdown */}
         <div className="bg-white rounded-lg border border-gray-200 p-4">
           <h3 className="text-sm font-semibold text-gray-900 mb-3 flex items-center gap-2">
             <CreditCard size={16} className="text-blue-500" /> Payment Methods
@@ -1490,7 +2056,6 @@ function MonthlySummaryView({ monthData }: { monthData: MonthData }) {
         </div>
       </div>
 
-      {/* Free / Comped weeks */}
       <div className="grid grid-cols-2 gap-3">
         <div className="bg-indigo-50 border border-indigo-200 rounded-lg p-3 flex items-center gap-3">
           <Gift size={20} className="text-indigo-600" />
@@ -1522,7 +2087,7 @@ function MonthlySummaryView({ monthData }: { monthData: MonthData }) {
 
 // ---- Sub-components ----
 
-function Th({ children, className }: { children: React.ReactNode; className?: string }) {
+function Th({ children, className }: { children?: React.ReactNode; className?: string }) {
   return (
     <th className={cn('px-3 py-2 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider', className)}>
       {children}
@@ -1532,20 +2097,30 @@ function Th({ children, className }: { children: React.ReactNode; className?: st
 
 function EntryRow({
   entry,
+  credit,
   onUpdate,
   onFrequencyChange,
   onPhoneChange,
   isEditing,
   onStartEdit,
   onStopEdit,
+  onAddTenant,
+  onEditTenant,
+  onMoveOutTenant,
+  onApplyCredit,
 }: {
   entry: MonthTenantEntry
+  credit: number
   onUpdate: (id: string, updates: Partial<TenantWeekEntry>, markManual?: boolean) => void
   onFrequencyChange: (id: string, freq: BillingFrequency) => void
   onPhoneChange: (id: string, phone: string) => void
   isEditing: boolean
   onStartEdit: () => void
   onStopEdit: () => void
+  onAddTenant: (suiteNumber: string) => void
+  onEditTenant: (tenantId: string) => void
+  onMoveOutTenant: (tenantId: string) => void
+  onApplyCredit: (tenantId: string) => void
 }) {
   const { tenant, status, isVacant } = entry
   const isSpecial = status === 'free_week' || status === 'comped_week'
@@ -1581,6 +2156,16 @@ function EntryRow({
                 ? status === 'monthly_pending' ? 'MONTHLY · Pending' : 'BI-WEEKLY · Off'
                 : tenant.billingFrequency === 'bi-weekly' ? 'BI-WEEKLY' : 'MONTHLY'}
             </span>
+          )}
+          {/* Credit badge */}
+          {credit > 0 && !isVacant && (
+            <button
+              onClick={() => onApplyCredit(tenant.id)}
+              className="text-[10px] font-semibold px-1.5 py-0.5 rounded border bg-emerald-50 text-emerald-700 border-emerald-200 hover:bg-emerald-100 cursor-pointer flex items-center gap-0.5"
+              title={`Apply ${formatCurrency(credit)} credit`}
+            >
+              <Wallet size={9} /> {formatCurrency(credit)}
+            </button>
           )}
         </div>
       </td>
@@ -1693,6 +2278,36 @@ function EntryRow({
           isVacant={isVacant || false}
         />
       </td>
+
+      {/* Actions column */}
+      <td className="px-2 py-1.5">
+        {isVacant ? (
+          <button
+            onClick={() => onAddTenant(tenant.suiteNumber)}
+            className="p-1 text-blue-500 hover:text-blue-700 hover:bg-blue-50 rounded"
+            title="Add tenant to this suite"
+          >
+            <UserPlus size={14} />
+          </button>
+        ) : (
+          <div className="flex items-center gap-0.5">
+            <button
+              onClick={() => onEditTenant(tenant.id)}
+              className="p-1 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded"
+              title="Edit tenant"
+            >
+              <Pencil size={13} />
+            </button>
+            <button
+              onClick={() => onMoveOutTenant(tenant.id)}
+              className="p-1 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded"
+              title="Move out tenant"
+            >
+              <DoorOpen size={13} />
+            </button>
+          </div>
+        )}
+      </td>
     </tr>
   )
 }
@@ -1794,10 +2409,10 @@ function SummaryItem({ label, value, valueColor }: { label: string; value: strin
   )
 }
 
-function Modal({ onClose, title, children }: { onClose: () => void; title: string; children: React.ReactNode }) {
+function Modal({ onClose, title, children, wide }: { onClose: () => void; title: string; children: React.ReactNode; wide?: boolean }) {
   return (
     <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50" onClick={onClose}>
-      <div className="bg-white rounded-xl shadow-xl p-5 w-full max-w-md mx-4" onClick={e => e.stopPropagation()}>
+      <div className={cn('bg-white rounded-xl shadow-xl p-5 mx-4', wide ? 'w-full max-w-2xl' : 'w-full max-w-md')} onClick={e => e.stopPropagation()}>
         <h3 className="text-lg font-semibold text-gray-900 mb-3">{title}</h3>
         {children}
       </div>

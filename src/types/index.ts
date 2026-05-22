@@ -17,15 +17,22 @@ export type PaymentSource = 'tenantcloud' | 'zelle' | 'check' | 'cash' | 'manual
 export interface Tenant {
   id: string
   name: string
+  secondName?: string
   suiteNumber: string
   weeklyRent: number
   billingFrequency: BillingFrequency
+  defaultPayType?: PaymentType
   phone?: string
   email?: string
   isActive: boolean
+  isArchived?: boolean
+  moveInDate?: string
+  movedOutDate?: string
   leaseStart?: string
   leaseEnd?: string
+  securityDeposit?: number
   notes?: string
+  credit?: number
 }
 
 export interface Payment {
