@@ -55,6 +55,7 @@ export default function RentTracker() {
   const [smsLoading, setSmsLoading] = useState(false)
   const [smsResults, setSmsResults] = useState<Array<{ tenantName: string; suiteNumber: string; success: boolean; error?: string }> | null>(null)
   const [smsSentThisWeek, setSmsSentThisWeek] = useState<Set<string>>(new Set())
+  const [smsSelected, setSmsSelected] = useState<Set<string>>(new Set())
 
   // Gmail / Zelle state
   const [gmailConnected, setGmailConnected] = useState<boolean | null>(null)
@@ -1367,7 +1368,7 @@ export default function RentTracker() {
 
       {/* SMS Late Reminder Modal */}
       {showSMSPreview && (
-        <Modal onClose={() => { setShowSMSPreview(false); setSmsResults(null) }} title={`Late Rent Reminders — ${monthLabel(monthKey)}`} wide>
+        <Modal onClose={() => { setShowSMSPreview(false); setSmsResults(null); setSmsSelected(new Set()) }} title={`Late Rent Reminders — ${monthLabel(monthKey)}`} wide>
           <div className="space-y-4">
             {smsResults ? (
               <div className="space-y-3">
@@ -1383,12 +1384,14 @@ export default function RentTracker() {
                     </div>
                   ))}
                 </div>
-                <button onClick={() => { setShowSMSPreview(false); setSmsResults(null) }} className="w-full px-4 py-2 bg-gray-100 text-gray-700 text-sm font-medium rounded-lg hover:bg-gray-200">Done</button>
+                <button onClick={() => { setShowSMSPreview(false); setSmsResults(null); setSmsSelected(new Set()) }} className="w-full px-4 py-2 bg-gray-100 text-gray-700 text-sm font-medium rounded-lg hover:bg-gray-200">Done</button>
               </div>
             ) : (
               (() => {
                 const summaries = getLateTenantsSummary()
                 const totalOwedAll = summaries.reduce((sum, s) => sum + s.totalOwed, 0)
+                const selectedCount = smsSelected.size
+                const selectedSummaries = summaries.filter(s => smsSelected.has(s.tenant.id))
 
                 return (
                   <div className="space-y-3">
@@ -1398,47 +1401,88 @@ export default function RentTracker() {
                         <span className="text-sm text-orange-800">
                           <strong>{summaries.length}</strong> tenant{summaries.length !== 1 ? 's' : ''} with outstanding rent
                         </span>
-                        <span className="text-sm font-semibold text-orange-900">
-                          {formatCurrency(totalOwedAll)} total owed
-                        </span>
+                        <div className="flex items-center gap-3">
+                          <span className="text-sm font-semibold text-orange-900">
+                            {formatCurrency(totalOwedAll)} total owed
+                          </span>
+                          {/* Select all / none toggle */}
+                          <button
+                            onClick={() => {
+                              if (selectedCount === summaries.length) {
+                                setSmsSelected(new Set())
+                              } else {
+                                setSmsSelected(new Set(summaries.map(s => s.tenant.id)))
+                              }
+                            }}
+                            className="text-[10px] text-orange-600 hover:text-orange-800 font-medium underline"
+                          >
+                            {selectedCount === summaries.length ? 'Deselect all' : 'Select all'}
+                          </button>
+                        </div>
                       </div>
                     )}
 
                     {summaries.length > 0 ? (
                       <div className="max-h-[420px] overflow-y-auto space-y-3">
-                        {summaries.map(s => (
-                          <div key={s.tenant.id} className="border border-gray-200 rounded-lg overflow-hidden">
-                            {/* Tenant header */}
-                            <div className="bg-gray-50 px-3 py-2 flex items-center justify-between border-b border-gray-200">
-                              <div className="flex items-center gap-2">
-                                <span className="text-sm font-semibold text-gray-900">
-                                  {s.tenant.suiteNumber} — {s.tenant.name}
-                                </span>
-                                <span className="text-xs text-red-600 font-medium bg-red-50 px-1.5 py-0.5 rounded">
-                                  {s.lateWeeks.length} week{s.lateWeeks.length !== 1 ? 's' : ''} · {formatCurrency(s.totalOwed)}
-                                </span>
-                              </div>
-                              <span className="text-xs text-gray-500 flex items-center gap-1">
-                                <Phone size={10} /> {s.tenant.phone}
-                              </span>
-                            </div>
-                            {/* Week breakdown */}
-                            <div className="px-3 py-1.5 bg-white">
-                              <div className="flex flex-wrap gap-1.5 mb-2">
-                                {s.lateWeeks.map((w, wi) => (
-                                  <span key={wi} className="text-[11px] bg-red-50 text-red-700 px-2 py-0.5 rounded border border-red-100">
-                                    {w.weekLabel}: {formatCurrency(w.amountDue - w.amountPaid)}
+                        {summaries.map(s => {
+                          const isChecked = smsSelected.has(s.tenant.id)
+                          return (
+                            <div
+                              key={s.tenant.id}
+                              className={cn(
+                                'border rounded-lg overflow-hidden transition-colors cursor-pointer',
+                                isChecked ? 'border-orange-300 ring-1 ring-orange-200' : 'border-gray-200'
+                              )}
+                              onClick={() => {
+                                setSmsSelected(prev => {
+                                  const next = new Set(prev)
+                                  if (next.has(s.tenant.id)) {
+                                    next.delete(s.tenant.id)
+                                  } else {
+                                    next.add(s.tenant.id)
+                                  }
+                                  return next
+                                })
+                              }}
+                            >
+                              {/* Tenant header */}
+                              <div className={cn('px-3 py-2 flex items-center justify-between border-b', isChecked ? 'bg-orange-50 border-orange-200' : 'bg-gray-50 border-gray-200')}>
+                                <div className="flex items-center gap-2">
+                                  <div className={cn(
+                                    'w-4 h-4 rounded border flex items-center justify-center flex-shrink-0',
+                                    isChecked ? 'bg-orange-500 border-orange-500' : 'bg-white border-gray-300'
+                                  )}>
+                                    {isChecked && <Check size={10} className="text-white" />}
+                                  </div>
+                                  <span className="text-sm font-semibold text-gray-900">
+                                    {s.tenant.suiteNumber} — {s.tenant.name}
                                   </span>
-                                ))}
+                                  <span className="text-xs text-red-600 font-medium bg-red-50 px-1.5 py-0.5 rounded">
+                                    {s.lateWeeks.length} week{s.lateWeeks.length !== 1 ? 's' : ''} · {formatCurrency(s.totalOwed)}
+                                  </span>
+                                </div>
+                                <span className="text-xs text-gray-500 flex items-center gap-1">
+                                  <Phone size={10} /> {s.tenant.phone}
+                                </span>
+                              </div>
+                              {/* Week breakdown */}
+                              <div className="px-3 py-1.5 bg-white">
+                                <div className="flex flex-wrap gap-1.5 mb-2">
+                                  {s.lateWeeks.map((w, wi) => (
+                                    <span key={wi} className="text-[11px] bg-red-50 text-red-700 px-2 py-0.5 rounded border border-red-100">
+                                      {w.weekLabel}: {formatCurrency(w.amountDue - w.amountPaid)}
+                                    </span>
+                                  ))}
+                                </div>
+                              </div>
+                              {/* Message preview */}
+                              <div className="px-3 py-2 bg-gray-50 border-t border-gray-100">
+                                <p className="text-[10px] font-medium text-gray-400 uppercase tracking-wider mb-0.5">Message Preview</p>
+                                <p className="text-xs text-gray-700 whitespace-pre-line leading-relaxed">{s.message}</p>
                               </div>
                             </div>
-                            {/* Message preview */}
-                            <div className="px-3 py-2 bg-gray-50 border-t border-gray-100">
-                              <p className="text-[10px] font-medium text-gray-400 uppercase tracking-wider mb-0.5">Message Preview</p>
-                              <p className="text-xs text-gray-700 whitespace-pre-line leading-relaxed">{s.message}</p>
-                            </div>
-                          </div>
-                        ))}
+                          )
+                        })}
                       </div>
                     ) : (
                       <div className="text-center py-8 space-y-2">
@@ -1449,17 +1493,28 @@ export default function RentTracker() {
                     )}
 
                     <div className="flex gap-2 pt-2">
+                      {/* Send selected */}
                       <button
-                        onClick={() => handleSendReminders(summaries)}
-                        disabled={summaries.length === 0 || smsLoading}
+                        onClick={() => handleSendReminders(selectedSummaries)}
+                        disabled={selectedCount === 0 || smsLoading}
                         className="flex-1 px-4 py-2 bg-orange-500 text-white text-sm font-medium rounded-lg hover:bg-orange-600 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
                       >
                         {smsLoading
-                          ? (<><Loader2 size={14} className="animate-spin" /> Sending {summaries.length} text{summaries.length !== 1 ? 's' : ''}...</>)
-                          : (<><Send size={14} /> Send {summaries.length} Reminder{summaries.length !== 1 ? 's' : ''}</>)
+                          ? (<><Loader2 size={14} className="animate-spin" /> Sending...</>)
+                          : (<><Send size={14} /> Send to {selectedCount} Selected</>)
                         }
                       </button>
-                      <button onClick={() => setShowSMSPreview(false)} className="px-4 py-2 text-gray-600 text-sm hover:text-gray-800">Cancel</button>
+                      {/* Send all shortcut */}
+                      {selectedCount !== summaries.length && summaries.length > 1 && (
+                        <button
+                          onClick={() => handleSendReminders(summaries)}
+                          disabled={summaries.length === 0 || smsLoading}
+                          className="px-4 py-2 bg-red-500 text-white text-sm font-medium rounded-lg hover:bg-red-600 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+                        >
+                          <Send size={14} /> Send All ({summaries.length})
+                        </button>
+                      )}
+                      <button onClick={() => { setShowSMSPreview(false); setSmsSelected(new Set()) }} className="px-4 py-2 text-gray-600 text-sm hover:text-gray-800">Cancel</button>
                     </div>
                   </div>
                 )
