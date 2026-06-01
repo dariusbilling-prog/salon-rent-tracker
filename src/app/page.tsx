@@ -17,7 +17,7 @@ import {
 } from '@/lib/utils'
 import { generateWeeklyPDF } from '@/lib/pdf-generator'
 import { parseAndMatchCSV, CSVMatchResult } from '@/lib/csv-parser'
-import { buildReminderMessage, formatPhoneForSMS } from '@/lib/sms'
+import { buildReminderMessage, buildDetailedReminder, formatPhoneForSMS, LateWeekInfo } from '@/lib/sms'
 import {
   MonthData, MonthTenantEntry, createEmptyMonth, mergeCSVIntoMonth,
   saveMonthData, loadMonthData, calculateMonthlySummary,
@@ -607,12 +607,80 @@ export default function RentTracker() {
     setCreditPrompt(null)
   }, [])
 
-  // SMS reminders
+  // SMS reminders — scan ALL weeks in month for late/unpaid tenants
+  interface LateTenantSummary {
+    tenant: Tenant
+    lateWeeks: LateWeekInfo[]
+    totalOwed: number
+    message: string
+  }
+
+  const getLateTenantsSummary = useCallback((): LateTenantSummary[] => {
+    const fridays = Object.keys(monthData.weeks).sort()
+    const today = new Date()
+    today.setHours(0, 0, 0, 0)
+    const mLabel = monthLabel(monthKey)
+
+    // Collect late/unpaid weeks per tenant across the whole month
+    const tenantMap = new Map<string, { tenant: Tenant; weeks: LateWeekInfo[] }>()
+
+    fridays.forEach((friday, idx) => {
+      const entries = monthData.weeks[friday] || []
+      const [fy, fm, fd] = friday.split('-').map(Number)
+      const fridayDate = new Date(fy, fm - 1, fd)
+      fridayDate.setHours(0, 0, 0, 0)
+      const isPastDue = today > fridayDate
+
+      for (const entry of entries) {
+        if (entry.isVacant) continue
+        if (!entry.tenant.phone || !entry.tenant.phone.trim()) continue
+        if (!formatPhoneForSMS(entry.tenant.phone)) continue
+        if (smsSentThisWeek.has(entry.tenant.id)) continue
+
+        // Check if this entry is late/unpaid (only for past-due weeks)
+        const effectiveStatus = isPastDue && entry.status === 'unpaid' ? 'late' : entry.status
+        if (effectiveStatus !== 'late' && effectiveStatus !== 'unpaid') continue
+        if (entry.status === 'free_week' || entry.status === 'comped_week' || entry.status === 'biweekly_off') continue
+
+        // Only include if they still owe something
+        const owed = entry.amountDue - entry.amountPaid
+        if (owed <= 0) continue
+
+        if (!tenantMap.has(entry.tenant.id)) {
+          tenantMap.set(entry.tenant.id, { tenant: entry.tenant, weeks: [] })
+        }
+
+        tenantMap.get(entry.tenant.id)!.weeks.push({
+          weekLabel: `Week ${idx + 1} (${fridayShortLabel(friday)})`,
+          amountDue: entry.amountDue,
+          amountPaid: entry.amountPaid,
+        })
+      }
+    })
+
+    // Build summaries with personalized messages
+    const summaries: LateTenantSummary[] = []
+    const entries = Array.from(tenantMap.values())
+    for (const data of entries) {
+      if (data.weeks.length === 0) continue
+      const totalOwed = data.weeks.reduce((sum: number, w: LateWeekInfo) => sum + (w.amountDue - w.amountPaid), 0)
+      const message = buildDetailedReminder(data.tenant.name, data.weeks, mLabel)
+      summaries.push({
+        tenant: data.tenant,
+        lateWeeks: data.weeks,
+        totalOwed,
+        message,
+      })
+    }
+
+    return summaries.sort((a, b) => b.totalOwed - a.totalOwed)
+  }, [monthData, monthKey, smsSentThisWeek])
+
+  // Legacy getLateTenants for backward compat (used nowhere else now, but safe to keep)
   const getLateTenants = useCallback(() => {
     return currentWeekEntries.filter(e =>
       !e.isVacant &&
       (e.status === 'unpaid' || e.status === 'late') &&
-      e.tenant.billingFrequency === 'weekly' &&
       e.tenant.phone &&
       e.tenant.phone.trim() !== '' &&
       formatPhoneForSMS(e.tenant.phone) !== null &&
@@ -620,9 +688,8 @@ export default function RentTracker() {
     )
   }, [currentWeekEntries, smsSentThisWeek])
 
-  const handleSendReminders = useCallback(async () => {
-    const lateTenants = getLateTenants()
-    if (lateTenants.length === 0) return
+  const handleSendReminders = useCallback(async (summaries: LateTenantSummary[]) => {
+    if (summaries.length === 0) return
 
     setSmsLoading(true)
     setSmsResults(null)
@@ -632,10 +699,11 @@ export default function RentTracker() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          tenants: lateTenants.map(e => ({
-            tenantName: e.tenant.name,
-            suiteNumber: e.tenant.suiteNumber,
-            phone: e.tenant.phone,
+          tenants: summaries.map(s => ({
+            tenantName: s.tenant.name,
+            suiteNumber: s.tenant.suiteNumber,
+            phone: s.tenant.phone,
+            message: s.message,
           }))
         })
       })
@@ -652,8 +720,8 @@ export default function RentTracker() {
       const sentIds = new Set(smsSentThisWeek)
       for (const result of data.results) {
         if (result.success) {
-          const entry = lateTenants.find(e => e.tenant.suiteNumber === result.suiteNumber)
-          if (entry) sentIds.add(entry.tenant.id)
+          const summary = summaries.find(s => s.tenant.suiteNumber === result.suiteNumber)
+          if (summary) sentIds.add(summary.tenant.id)
         }
       }
       setSmsSentThisWeek(sentIds)
@@ -662,7 +730,7 @@ export default function RentTracker() {
     } finally {
       setSmsLoading(false)
     }
-  }, [getLateTenants, smsSentThisWeek])
+  }, [smsSentThisWeek])
 
   // ---- Tenant Management Handlers ----
   const handleOpenAddTenant = useCallback((suiteNumber: string) => {
@@ -1299,7 +1367,7 @@ export default function RentTracker() {
 
       {/* SMS Late Reminder Modal */}
       {showSMSPreview && (
-        <Modal onClose={() => { setShowSMSPreview(false); setSmsResults(null) }} title="Send Late Rent Reminders">
+        <Modal onClose={() => { setShowSMSPreview(false); setSmsResults(null) }} title={`Late Rent Reminders — ${monthLabel(monthKey)}`} wide>
           <div className="space-y-4">
             {smsResults ? (
               <div className="space-y-3">
@@ -1318,44 +1386,84 @@ export default function RentTracker() {
                 <button onClick={() => { setShowSMSPreview(false); setSmsResults(null) }} className="w-full px-4 py-2 bg-gray-100 text-gray-700 text-sm font-medium rounded-lg hover:bg-gray-200">Done</button>
               </div>
             ) : (
-              <>
-                <div className="bg-gray-50 rounded-lg p-3 border border-gray-200">
-                  <p className="text-xs font-medium text-gray-500 uppercase tracking-wider mb-1">Message Preview</p>
-                  <p className="text-sm text-gray-800 italic">&ldquo;{buildReminderMessage('Tenant Name')}&rdquo;</p>
-                </div>
-                {(() => {
-                  const lateTenants = getLateTenants()
-                  return (
-                    <div className="space-y-3">
-                      {lateTenants.length > 0 ? (
-                        <div>
-                          <p className="text-xs font-medium text-gray-500 uppercase tracking-wider mb-2">Will receive text ({lateTenants.length})</p>
-                          <div className="max-h-40 overflow-y-auto space-y-1">
-                            {lateTenants.map(e => (
-                              <div key={e.tenant.id} className="text-xs bg-orange-50 text-orange-800 px-3 py-2 rounded flex items-center justify-between">
-                                <span className="font-medium">{e.tenant.suiteNumber} — {e.tenant.name}</span>
-                                <span className="text-orange-500 flex items-center gap-1"><Phone size={10} /> {e.tenant.phone}</span>
-                              </div>
-                            ))}
-                          </div>
-                        </div>
-                      ) : (
-                        <div className="text-sm text-gray-500 text-center py-4">No late tenants with phone numbers to text.</div>
-                      )}
-                      <div className="flex gap-2 pt-2">
-                        <button
-                          onClick={handleSendReminders}
-                          disabled={lateTenants.length === 0 || smsLoading}
-                          className="flex-1 px-4 py-2 bg-orange-500 text-white text-sm font-medium rounded-lg hover:bg-orange-600 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
-                        >
-                          {smsLoading ? (<><Loader2 size={14} className="animate-spin" /> Sending...</>) : (<><Send size={14} /> Send {lateTenants.length} Reminder{lateTenants.length !== 1 ? 's' : ''}</>)}
-                        </button>
-                        <button onClick={() => setShowSMSPreview(false)} className="px-4 py-2 text-gray-600 text-sm hover:text-gray-800">Cancel</button>
+              (() => {
+                const summaries = getLateTenantsSummary()
+                const totalOwedAll = summaries.reduce((sum, s) => sum + s.totalOwed, 0)
+
+                return (
+                  <div className="space-y-3">
+                    {/* Summary banner */}
+                    {summaries.length > 0 && (
+                      <div className="bg-orange-50 border border-orange-200 rounded-lg px-3 py-2 flex items-center justify-between">
+                        <span className="text-sm text-orange-800">
+                          <strong>{summaries.length}</strong> tenant{summaries.length !== 1 ? 's' : ''} with outstanding rent
+                        </span>
+                        <span className="text-sm font-semibold text-orange-900">
+                          {formatCurrency(totalOwedAll)} total owed
+                        </span>
                       </div>
+                    )}
+
+                    {summaries.length > 0 ? (
+                      <div className="max-h-[420px] overflow-y-auto space-y-3">
+                        {summaries.map(s => (
+                          <div key={s.tenant.id} className="border border-gray-200 rounded-lg overflow-hidden">
+                            {/* Tenant header */}
+                            <div className="bg-gray-50 px-3 py-2 flex items-center justify-between border-b border-gray-200">
+                              <div className="flex items-center gap-2">
+                                <span className="text-sm font-semibold text-gray-900">
+                                  {s.tenant.suiteNumber} — {s.tenant.name}
+                                </span>
+                                <span className="text-xs text-red-600 font-medium bg-red-50 px-1.5 py-0.5 rounded">
+                                  {s.lateWeeks.length} week{s.lateWeeks.length !== 1 ? 's' : ''} · {formatCurrency(s.totalOwed)}
+                                </span>
+                              </div>
+                              <span className="text-xs text-gray-500 flex items-center gap-1">
+                                <Phone size={10} /> {s.tenant.phone}
+                              </span>
+                            </div>
+                            {/* Week breakdown */}
+                            <div className="px-3 py-1.5 bg-white">
+                              <div className="flex flex-wrap gap-1.5 mb-2">
+                                {s.lateWeeks.map((w, wi) => (
+                                  <span key={wi} className="text-[11px] bg-red-50 text-red-700 px-2 py-0.5 rounded border border-red-100">
+                                    {w.weekLabel}: {formatCurrency(w.amountDue - w.amountPaid)}
+                                  </span>
+                                ))}
+                              </div>
+                            </div>
+                            {/* Message preview */}
+                            <div className="px-3 py-2 bg-gray-50 border-t border-gray-100">
+                              <p className="text-[10px] font-medium text-gray-400 uppercase tracking-wider mb-0.5">Message Preview</p>
+                              <p className="text-xs text-gray-700 whitespace-pre-line leading-relaxed">{s.message}</p>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="text-center py-8 space-y-2">
+                        <Check size={28} className="mx-auto text-green-400" />
+                        <p className="text-sm text-gray-500">No late tenants with phone numbers to text.</p>
+                        <p className="text-xs text-gray-400">All tenants with phone numbers are current on rent.</p>
+                      </div>
+                    )}
+
+                    <div className="flex gap-2 pt-2">
+                      <button
+                        onClick={() => handleSendReminders(summaries)}
+                        disabled={summaries.length === 0 || smsLoading}
+                        className="flex-1 px-4 py-2 bg-orange-500 text-white text-sm font-medium rounded-lg hover:bg-orange-600 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+                      >
+                        {smsLoading
+                          ? (<><Loader2 size={14} className="animate-spin" /> Sending {summaries.length} text{summaries.length !== 1 ? 's' : ''}...</>)
+                          : (<><Send size={14} /> Send {summaries.length} Reminder{summaries.length !== 1 ? 's' : ''}</>)
+                        }
+                      </button>
+                      <button onClick={() => setShowSMSPreview(false)} className="px-4 py-2 text-gray-600 text-sm hover:text-gray-800">Cancel</button>
                     </div>
-                  )
-                })()}
-              </>
+                  </div>
+                )
+              })()
             )}
           </div>
         </Modal>
