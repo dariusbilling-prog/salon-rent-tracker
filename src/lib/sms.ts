@@ -36,11 +36,38 @@ export function formatPhoneForSMS(phone: string): string | null {
   return null // Invalid
 }
 
-// Build the late reminder message with tenant name personalization
+// Build the late reminder message with tenant name personalization (legacy — single week)
 export function buildReminderMessage(tenantName: string): string {
-  // Use just the first name for a personal touch
   const firstName = tenantName.split(/[,/&\s]+/)[0].trim()
   return `Hi ${firstName}, I wanted to follow up regarding your rent from this past Friday. Will you be able to catch that up today? Thank you!`
+}
+
+// Detailed reminder with per-week breakdown of what's owed
+export interface LateWeekInfo {
+  weekLabel: string   // e.g. "Week 3 (5/15)"
+  amountDue: number
+  amountPaid: number
+}
+
+const DO_NOT_REPLY = `\n\nThis is an automated message — please do not reply to this number. If you need to reach me, contact me directly.`
+
+export function buildDetailedReminder(tenantName: string, lateWeeks: LateWeekInfo[], monthName: string): string {
+  const firstName = tenantName.split(/[,/&\s]+/)[0].trim()
+  const totalOwed = lateWeeks.reduce((sum, w) => sum + (w.amountDue - w.amountPaid), 0)
+
+  if (lateWeeks.length === 1) {
+    const w = lateWeeks[0]
+    const owed = w.amountDue - w.amountPaid
+    return `Hi ${firstName}, this is a reminder that your rent for ${w.weekLabel} is outstanding ($${owed.toFixed(2)}). Please arrange payment at your earliest convenience. Thank you!${DO_NOT_REPLY}`
+  }
+
+  // Multiple weeks
+  const weekLines = lateWeeks.map(w => {
+    const owed = w.amountDue - w.amountPaid
+    return `  ${w.weekLabel} — $${owed.toFixed(2)}`
+  }).join('\n')
+
+  return `Hi ${firstName}, you have ${lateWeeks.length} weeks outstanding for ${monthName}:\n${weekLines}\nTotal: $${totalOwed.toFixed(2)}\nPlease arrange payment at your earliest convenience. Thank you!${DO_NOT_REPLY}`
 }
 
 // Send SMS via Twilio REST API (no SDK needed — just fetch)
