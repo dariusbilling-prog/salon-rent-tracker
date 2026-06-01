@@ -1,11 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { sendSMS, formatPhoneForSMS, buildReminderMessage } from '@/lib/sms'
+import { sendSMS, formatPhoneForSMS } from '@/lib/sms'
 
 interface ReminderRequest {
   tenants: Array<{
     tenantName: string
     suiteNumber: string
     phone: string
+    message: string  // Pre-built personalized message from the frontend
   }>
 }
 
@@ -16,7 +17,7 @@ export async function POST(request: NextRequest) {
 
   if (!accountSid || !authToken || !fromNumber) {
     return NextResponse.json(
-      { error: 'Twilio is not configured. Add TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, and TWILIO_PHONE_NUMBER to your environment variables.' },
+      { error: 'Twilio is not configured. Add TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, and TWILIO_PHONE_NUMBER to your Vercel environment variables.' },
       { status: 500 }
     )
   }
@@ -44,8 +45,7 @@ export async function POST(request: NextRequest) {
         continue
       }
 
-      const message = buildReminderMessage(tenant.tenantName)
-      const result = await sendSMS(formattedPhone, message, accountSid, authToken, fromNumber)
+      const result = await sendSMS(formattedPhone, tenant.message, accountSid, authToken, fromNumber)
 
       results.push({
         tenantName: tenant.tenantName,
@@ -56,7 +56,7 @@ export async function POST(request: NextRequest) {
         error: result.error,
       })
 
-      // Small delay between messages
+      // Small delay between messages to avoid rate limiting
       await new Promise(resolve => setTimeout(resolve, 200))
     }
 
