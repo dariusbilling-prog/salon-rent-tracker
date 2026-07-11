@@ -1,156 +1,22 @@
+// Cloud persistence for the Salon Rent Tracker.
+// The app's working data lives client-side as JSON (tenants, credits, monthly
+// data). We mirror those JSON blobs into Postgres so the data is durable,
+// available across devices, and readable by the Command Center dashboard.
+
 generator client {
   provider = "prisma-client-js"
 }
 
 datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
+  provider  = "postgresql"
+  url       = env("DATABASE_URL") // pooled (Supabase transaction pooler)
+  directUrl = env("DIRECT_URL")   // direct/session (used by Prisma CLI)
 }
 
-model Location {
-  id        String   @id @default(uuid())
-  name      String
-  address   String?
-  createdAt DateTime @default(now())
-
-  tenants   Tenant[]
-  rentWeeks RentWeek[]
-}
-
-model Tenant {
-  id               String           @id @default(uuid())
-  name             String
-  suiteNumber      String
-  weeklyRent       Decimal          @db.Decimal(10, 2)
-  billingFrequency BillingFrequency @default(WEEKLY)
-  phone            String?
-  email            String?
-  isActive         Boolean          @default(true)
-  leaseStart       DateTime?
-  leaseEnd         DateTime?
-  notes            String?
-  locationId       String
-  createdAt        DateTime         @default(now())
-  updatedAt        DateTime         @updatedAt
-
-  location         Location         @relation(fields: [locationId], references: [id])
-  aliases          TenantAlias[]
-  payments         Payment[]
-  weekStatuses     TenantWeekStatus[]
-  smsLogs          SmsLog[]
-}
-
-model TenantAlias {
-  id        String   @id @default(uuid())
-  alias     String
-  source    String   // 'zelle', 'tenantcloud', 'manual'
-  tenantId  String
-  createdAt DateTime @default(now())
-
-  tenant    Tenant   @relation(fields: [tenantId], references: [id])
-
-  @@unique([alias, source])
-}
-
-model RentWeek {
-  id         String   @id @default(uuid())
-  weekLabel  String
-  weekStart  DateTime
-  weekEnd    DateTime
-  dueDate    DateTime
-  status     String   @default("open") // 'open', 'closed', 'archived'
-  locationId String
-  createdAt  DateTime @default(now())
-
-  location     Location           @relation(fields: [locationId], references: [id])
-  payments     Payment[]
-  weekStatuses TenantWeekStatus[]
-  reports      WeeklyReport[]
-  smsLogs      SmsLog[]
-
-  @@unique([weekStart, locationId])
-}
-
-model Payment {
-  id             String   @id @default(uuid())
-  tenantId       String?
-  rentWeekId     String
-  amount         Decimal  @db.Decimal(10, 2)
-  paymentDate    DateTime
-  source         String   // 'tenantcloud', 'zelle', 'check', 'cash', 'manual'
-  paymentType    String   // 'ACH', 'Card', 'Zelle', 'Check', 'Cash', 'Money Order'
-  checkNumber    String?
-  confirmation   String?  // 'Card Processed', 'Cash', etc.
-  notes          String?
-  matchMethod    String?  // 'exact', 'alias', 'fuzzy', 'manual'
-  matchConfidence Float?
-  isReviewed     Boolean  @default(false)
-  importSource   String?  // 'csv', 'gmail', 'manual'
-  gmailMessageId String?  @unique
-  senderName     String?
-  memo           String?
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
-
-  tenant         Tenant?  @relation(fields: [tenantId], references: [id])
-  rentWeek       RentWeek @relation(fields: [rentWeekId], references: [id])
-}
-
-model TenantWeekStatus {
-  id             String   @id @default(uuid())
-  tenantId       String
-  rentWeekId     String
-  status         WeekStatus @default(UNPAID)
-  amountDue      Decimal  @db.Decimal(10, 2)
-  amountPaid     Decimal  @default(0) @db.Decimal(10, 2)
-  reminderSent   Boolean  @default(false)
-  reminderSentAt DateTime?
-  notes          String?
-  updatedAt      DateTime @updatedAt
-
-  tenant         Tenant   @relation(fields: [tenantId], references: [id])
-  rentWeek       RentWeek @relation(fields: [rentWeekId], references: [id])
-
-  @@unique([tenantId, rentWeekId])
-}
-
-model SmsLog {
-  id         String   @id @default(uuid())
-  tenantId   String
-  rentWeekId String?
-  phone      String
-  message    String
-  twilioSid  String?
-  status     String?  // 'sent', 'delivered', 'failed'
-  sentAt     DateTime @default(now())
-
-  tenant     Tenant   @relation(fields: [tenantId], references: [id])
-  rentWeek   RentWeek? @relation(fields: [rentWeekId], references: [id])
-}
-
-model WeeklyReport {
-  id          String   @id @default(uuid())
-  rentWeekId  String
-  reportType  String   // 'excel', 'pdf'
-  fileUrl     String?
-  generatedAt DateTime @default(now())
-
-  rentWeek    RentWeek @relation(fields: [rentWeekId], references: [id])
-}
-
-enum BillingFrequency {
-  WEEKLY
-  BI_WEEKLY
-  MONTHLY
-}
-
-enum WeekStatus {
-  PAID
-  PARTIAL
-  LATE
-  UNPAID
-  FREE_WEEK
-  COMPED_WEEK
-  MONTHLY_PENDING
-  BIWEEKLY_OFF
+/// One row per localStorage key: "salon-tenants", "salon-credits",
+/// "salon-rent:YYYY-MM". `json` holds the exact structure the app already uses.
+model AppState {
+  key       String   @id
+  json      Json
+  updatedAt DateTime @updatedAt @default(now())
 }

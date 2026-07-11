@@ -5,6 +5,7 @@ import { Tenant, TenantWeekEntry, PaymentType } from '@/types'
 import { generateWeekEntries } from './tenant-data'
 import { getFridaysInMonth } from './utils'
 import { CSVMatch } from './csv-parser'
+import { pushKey } from './cloud-sync'
 
 // Tracks the origin of a payment so we know whether to preserve it on re-upload
 export type PaymentSource = 'csv' | 'manual' | 'zelle-gmail' | 'none'
@@ -153,6 +154,7 @@ export function saveMonthData(data: MonthData) {
   } catch (err) {
     console.error('Failed to save month data:', err)
   }
+  pushKey(STORAGE_PREFIX + data.monthKey, data) // best-effort cloud mirror
 }
 
 export function loadMonthData(monthKey: string): MonthData | null {

@@ -3,6 +3,7 @@
 
 import { Tenant, PaymentType, BillingFrequency } from '@/types'
 import { TENANTS as DEFAULT_TENANTS } from './tenant-data'
+import { pushKey } from './cloud-sync'
 
 const TENANTS_KEY = 'salon-tenants'
 const CREDITS_KEY = 'salon-credits'
@@ -28,6 +29,7 @@ export function saveTenants(tenants: Tenant[]) {
   } catch (err) {
     console.error('Failed to save tenants:', err)
   }
+  pushKey(TENANTS_KEY, tenants) // best-effort cloud mirror
 }
 
 let nextId = 100 // start high to avoid conflicts with seed data
@@ -180,6 +182,7 @@ export function saveCredits(credits: Record<string, number>) {
   } catch (err) {
     console.error('Failed to save credits:', err)
   }
+  pushKey(CREDITS_KEY, credits) // best-effort cloud mirror
 }
 
 export function addCredit(credits: Record<string, number>, tenantId: string, amount: number): Record<string, number> {

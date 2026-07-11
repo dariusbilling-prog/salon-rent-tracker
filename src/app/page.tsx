@@ -29,6 +29,7 @@ import {
   getActiveTenants, getArchivedTenants, loadCredits, saveCredits, addCredit,
   useCredit, getTenantCredit, TenantFormData
 } from '@/lib/tenant-manager'
+import { initCloudSync } from '@/lib/cloud-sync'
 
 const WEEK_STATUSES: WeekStatus[] = ['paid', 'partial', 'late', 'unpaid', 'free_week', 'comped_week']
 const PAYMENT_TYPES: PaymentType[] = ['ACH', 'Zelle', 'Check', 'Cash', 'Money Order', 'Card']
@@ -105,6 +106,27 @@ export default function RentTracker() {
       saveMonthData(monthData)
     }
   }, [monthData, monthKey])
+
+  // Cloud sync: on mount, hydrate from Postgres (cloud is source of truth),
+  // or migrate this browser's data up if the cloud is still empty. If the DB
+  // is unreachable it silently stays on localStorage, so the app never breaks.
+  useEffect(() => {
+    let cancelled = false
+    ;(async () => {
+      const result = await initCloudSync()
+      if (cancelled) return
+      if (result === 'hydrated') {
+        setTenants(loadTenants())
+        setCredits(loadCredits())
+        const loaded = loadMonthData(monthKey)
+        if (loaded) setMonthData(loaded)
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   // Check Gmail connection status on mount + after OAuth redirect
   useEffect(() => {
