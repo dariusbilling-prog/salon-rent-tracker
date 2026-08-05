@@ -56,6 +56,34 @@ export interface TenantFormData {
   notes?: string
 }
 
+/**
+ * The active tenant already living in a suite, if any.
+ *
+ * `createTenant` replaces the *vacant placeholder* for a suite, but it never
+ * checked for a real occupant — so adding someone to a suite that was already
+ * let silently produced two tenants in one room, each billing full rent. The
+ * suite can look empty on a month sheet built before they moved in, which makes
+ * this very easy to trigger by accident.
+ */
+export function findSuiteOccupant(tenants: Tenant[], suiteNumber: string): Tenant | undefined {
+  const suite = suiteNumber.trim()
+  return tenants.find(t => t.suiteNumber.trim() === suite && t.isActive && !t.isArchived)
+}
+
+/**
+ * Permanently remove a tenant added in error.
+ *
+ * Deliberately NOT the same as moving out: archiving preserves someone who
+ * really lived here, this erases a record that should never have existed. The
+ * caller must confirm the tenant holds no payments first — see
+ * `tenantHasPayments`. Money is never deleted to tidy up a roster.
+ */
+export function deleteTenant(tenants: Tenant[], tenantId: string): Tenant[] {
+  const updated = tenants.filter(t => t.id !== tenantId)
+  saveTenants(updated)
+  return updated
+}
+
 export function createTenant(tenants: Tenant[], data: TenantFormData): Tenant[] {
   const newTenant: Tenant = {
     id: generateId(),
@@ -135,6 +163,13 @@ export function archiveTenant(tenants: Tenant[], tenantId: string, lastDay: stri
     movedOutDate: lastDay,
   }
 
+  // Only leave a vacant placeholder if nobody else is still in the suite.
+  // Shared suites (and duplicates) otherwise gained a phantom "Vacant" row
+  // sitting alongside the tenant who is still there.
+  const stillOccupied = tenants.some(
+    t => t.id !== tenantId && t.suiteNumber === tenant.suiteNumber && t.isActive && !t.isArchived
+  )
+
   // Create a vacant placeholder for the suite
   const vacantPlaceholder: Tenant = {
     id: generateId(),
@@ -147,14 +182,17 @@ export function archiveTenant(tenants: Tenant[], tenantId: string, lastDay: stri
     phone: '',
   }
 
-  const updated = tenants.map(t => {
+  const updated: Tenant[] = tenants.map(t => {
     if (t.id === tenantId) return archivedTenant
     return t
   })
 
-  // Add vacant placeholder after the archived tenant
-  const archIdx = updated.findIndex(t => t.id === tenantId)
-  updated.splice(archIdx + 1, 0, vacantPlaceholder)
+  // Add vacant placeholder after the archived tenant — unless someone else is
+  // still in that suite, in which case the suite is not vacant at all.
+  if (!stillOccupied) {
+    const archIdx = updated.findIndex(t => t.id === tenantId)
+    updated.splice(archIdx + 1, 0, vacantPlaceholder)
+  }
 
   saveTenants(updated)
   return updated

@@ -22,7 +22,8 @@ import {
   MonthData, MonthTenantEntry, createEmptyMonth, mergeCSVIntoMonth,
   saveMonthData, loadMonthData, calculateMonthlySummary,
   matchZellePayments, applyZelleMatchesToMonth, ZelleMatch, recalcMonthDues,
-  reconcileMonthRoster, reconcileSavedMonths, listSavedMonths
+  reconcileMonthRoster, reconcileSavedMonths, listSavedMonths,
+  tenantHasPayments, purgeTenantFromSavedMonths
 } from '@/lib/month-data'
 import {
   MonthBook, WeekRef, allocationMonthKeys, loadBook, openWeeksFor, allWeeksFor,
@@ -32,6 +33,7 @@ import {
 import { DepositSlipResult } from '@/lib/check-scanner'
 import {
   loadTenants, saveTenants, createTenant, updateTenant, archiveTenant,
+  findSuiteOccupant, deleteTenant,
   getActiveTenants, getArchivedTenants, loadCredits, saveCredits, addCredit,
   useCredit, getTenantCredit, TenantFormData
 } from '@/lib/tenant-manager'
@@ -853,6 +855,17 @@ export default function RentTracker() {
 
   const handleSaveTenant = useCallback((data: TenantFormData) => {
     if (tenantPanelMode === 'add') {
+      // A suite can look empty on an older month sheet while someone is in fact
+      // living there — that stale view is what makes double-adding easy.
+      const occupant = findSuiteOccupant(tenants, data.suiteNumber)
+      if (occupant) {
+        setRosterNotice(
+          `Suite ${data.suiteNumber} is already let to ${occupant.name}. Edit them instead of adding a second tenant.`
+        )
+        setShowTenantPanel(false)
+        return
+      }
+
       const updated = createTenant(tenants, data)
       const roster = getActiveTenants(updated)
       setTenants(updated)
@@ -898,6 +911,35 @@ export default function RentTracker() {
     }
     setShowTenantPanel(false)
   }, [tenantPanelMode, selectedTenantId, tenants, monthKey, monthData])
+
+  /** Erase a tenant record created by mistake. Blocked if any money is attached. */
+  const handleDeleteTenant = useCallback((tenantId: string) => {
+    const doomed = tenants.find(t => t.id === tenantId)
+    if (!doomed) return
+    if (tenantHasPayments(tenantId, monthData)) {
+      setRosterNotice(`${doomed.name} has payments recorded — move them out instead of deleting.`)
+      setShowTenantPanel(false)
+      return
+    }
+
+    const updated = deleteTenant(tenants, tenantId)
+    setTenants(updated)
+    const roster = getActiveTenants(updated)
+
+    setMonthData(prev => reconcileMonthRoster(
+      { ...prev, weeks: Object.fromEntries(
+        Object.entries(prev.weeks).map(([f, es]) => [f, es.filter(e => e.tenant.id !== tenantId)])
+      ) },
+      roster
+    ))
+    const touched = purgeTenantFromSavedMonths(tenantId, monthData.monthKey)
+
+    setShowTenantPanel(false)
+    setSelectedTenantId(null)
+    setRosterNotice(
+      `${doomed.name} removed from ${monthLabel(monthData.monthKey)}${touched.length ? ` and ${touched.length} other month${touched.length !== 1 ? 's' : ''}` : ''}.`
+    )
+  }, [tenants, monthData])
 
   const handleMoveOutTenant = useCallback((tenantId: string) => {
     if (!moveOutDate) return
@@ -2070,6 +2112,7 @@ export default function RentTracker() {
           suiteNumber={tenantPanelSuite}
           tenant={selectedTenantId ? tenants.find(t => t.id === selectedTenantId) : undefined}
           onSave={handleSaveTenant}
+          onDelete={handleDeleteTenant}
           onClose={() => setShowTenantPanel(false)}
         />
       )}
@@ -2084,14 +2127,17 @@ function TenantPanel({
   suiteNumber,
   tenant,
   onSave,
+  onDelete,
   onClose,
 }: {
   mode: 'add' | 'edit'
   suiteNumber: string
   tenant?: Tenant
   onSave: (data: TenantFormData) => void
+  onDelete: (tenantId: string) => void
   onClose: () => void
 }) {
+  const [confirmDelete, setConfirmDelete] = useState(false)
   const [showDetails, setShowDetails] = useState(false)
   const [showSecondName, setShowSecondName] = useState(!!tenant?.secondName)
   const [form, setForm] = useState({
@@ -2355,7 +2401,44 @@ function TenantPanel({
         </div>
 
         {/* Footer */}
-        <div className="px-5 py-4 border-t border-gray-200 flex gap-2">
+        <div className="px-5 py-4 border-t border-gray-200 space-y-3">
+          {/* Removing a record entered by mistake is a different act from moving
+              someone out, and the wording has to keep the two apart. */}
+          {mode === 'edit' && tenant && (
+            confirmDelete ? (
+              <div className="rounded-lg border border-red-300 bg-red-50 px-3 py-2.5">
+                <p className="text-xs text-red-800 mb-2">
+                  Permanently remove <strong>{tenant.name}</strong> from suite {tenant.suiteNumber}?
+                  Use this only for a record added in error — for a tenant who really lived here,
+                  use <strong>Move Out</strong> so their history survives. Blocked automatically if
+                  any payment is attached.
+                </p>
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => onDelete(tenant.id)}
+                    className="px-3 py-1.5 bg-red-600 text-white text-xs font-medium rounded-lg hover:bg-red-700"
+                  >
+                    Yes, remove permanently
+                  </button>
+                  <button
+                    onClick={() => setConfirmDelete(false)}
+                    className="px-3 py-1.5 text-xs text-gray-600 hover:text-gray-800"
+                  >
+                    Keep
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <button
+                onClick={() => setConfirmDelete(true)}
+                className="text-xs text-red-600 hover:text-red-800 hover:underline"
+              >
+                Remove this tenant (added in error)
+              </button>
+            )
+          )}
+
+          <div className="flex gap-2">
           <button
             onClick={handleSubmit}
             disabled={!isValid}
@@ -2366,6 +2449,7 @@ function TenantPanel({
           <button onClick={onClose} className="px-4 py-2.5 text-gray-600 text-sm hover:text-gray-800">
             Cancel
           </button>
+          </div>
         </div>
       </div>
     </div>

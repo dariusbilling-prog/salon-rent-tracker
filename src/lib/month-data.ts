@@ -564,3 +564,56 @@ export function reconcileSavedMonths(roster: Tenant[], skipMonthKey?: string): s
   }
   return touched
 }
+
+/**
+ * Has this tenant any money recorded against them, in any stored month?
+ *
+ * The gate on deleting a tenant. Archiving is for people who really lived here;
+ * deleting is only ever for a record created by mistake, and a record with
+ * payments attached is by definition not a mistake.
+ */
+export function tenantHasPayments(tenantId: string, alsoCheck?: MonthData): boolean {
+  const scan = (data: MonthData) =>
+    Object.values(data.weeks).some(entries =>
+      entries.some(e => e.tenant.id === tenantId && e.amountPaid > 0)
+    )
+
+  if (alsoCheck && scan(alsoCheck)) return true
+  for (const key of listSavedMonths()) {
+    const data = loadMonthData(key)
+    if (data && scan(data)) return true
+  }
+  return false
+}
+
+/**
+ * Strip a tenant's (payment-free) rows out of every stored month.
+ * Refuses outright if any row holds money — belt and braces alongside
+ * `tenantHasPayments`, because losing a payment to a roster tidy-up would be
+ * far worse than leaving a stray row behind.
+ */
+export function purgeTenantFromSavedMonths(tenantId: string, skipMonthKey?: string): string[] {
+  const touched: string[] = []
+  for (const key of listSavedMonths()) {
+    if (key === skipMonthKey) continue
+    const data = loadMonthData(key)
+    if (!data) continue
+
+    let changed = false
+    const weeks: Record<string, MonthTenantEntry[]> = {}
+    for (const [friday, entries] of Object.entries(data.weeks)) {
+      const kept = entries.filter(e => {
+        if (e.tenant.id !== tenantId) return true
+        if (e.amountPaid > 0) return true // never drop money
+        changed = true
+        return false
+      })
+      weeks[friday] = kept
+    }
+
+    if (!changed) continue
+    saveMonthData({ ...data, weeks })
+    touched.push(key)
+  }
+  return touched
+}
