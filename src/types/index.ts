@@ -66,6 +66,14 @@ export interface TenantWeekEntry {
   checkNumber?: string
   notes?: string
   isVacant?: boolean
+  /**
+   * Portion of `amountPaid` that has not cleared the bank yet (TenantCloud ACH
+   * sitting in "Pending"). Counted as received for reconciliation, but excluded
+   * from COLLECTED so a month-end report never overstates cash on hand.
+   */
+  pendingAmount?: number
+  /** When the payment actually settled, ISO. Drives on-time vs late reporting. */
+  paidDate?: string
 }
 
 export interface WeekSummary {

@@ -156,13 +156,21 @@ export function mergeCSVIntoMonth(
         continue
       }
 
+      const isPending = match.pendingAmount > 0
       entries[idx] = {
         ...existing,
         amountPaid: match.amount,
         paymentType: match.paymentType,
         status: match.amount >= existing.amountDue ? 'paid' : 'partial',
-        confirmation:
-          match.paymentType === 'ACH' || match.paymentType === 'Card' ? 'Card Processed' : undefined,
+        // A pending ACH is money in flight, not money in the bank. Saying
+        // "Card Processed" here would tell the accountant it cleared.
+        confirmation: isPending
+          ? 'ACH Pending'
+          : match.paymentType === 'ACH' || match.paymentType === 'Card'
+            ? 'Card Processed'
+            : undefined,
+        pendingAmount: isPending ? match.pendingAmount : undefined,
+        paidDate: match.paidDate,
         paymentSource: 'csv',
       }
     }
@@ -457,4 +465,102 @@ export function calculateMonthlySummary(data: MonthData): MonthlySummary {
     compedWeeksGiven,
     weekBreakdown,
   }
+}
+
+// ---------------------------------------------------------------------------
+// Roster reconciliation
+// ---------------------------------------------------------------------------
+
+/** Sort suites the way the table reads them: 101/102, 103, 104 ... 128/129, 130. */
+function bySuite(a: MonthTenantEntry, b: MonthTenantEntry): number {
+  const num = (s: string) => parseInt(s.replace(/[^0-9]/g, '').slice(0, 3), 10) || 0
+  const d = num(a.tenant.suiteNumber) - num(b.tenant.suiteNumber)
+  return d !== 0 ? d : a.tenant.suiteNumber.localeCompare(b.tenant.suiteNumber)
+}
+
+/**
+ * Make one month's rows match the current tenant roster.
+ *
+ * Months freeze their roster at the moment they are created, so moving a tenant
+ * into a suite only ever affected the month you happened to be looking at. A
+ * tenant who moved into a vacant suite in June still showed as "Vacant" in every
+ * month already on disk, which left their earlier payments with nowhere to land.
+ *
+ * Rules, in order of precedence:
+ *  1. **Money is never destroyed.** An entry carrying a payment is preserved even
+ *     if that tenant has since left the roster — that is real history.
+ *  2. A roster tenant missing from a week gets added, *unless* another entry for
+ *     the same suite already holds a payment for that week. That stops a fresh
+ *     "Vacant" placeholder appearing next to the moved-out tenant who actually
+ *     paid, which would read as the suite being double-counted.
+ *  3. Existing rows keep their payments and adopt the current tenant record, so a
+ *     rename or rent change flows through without touching amounts.
+ */
+export function reconcileMonthRoster(data: MonthData, roster: Tenant[]): MonthData {
+  const fridays = Object.keys(data.weeks).sort()
+  const weeks: Record<string, MonthTenantEntry[]> = {}
+
+  for (let wi = 0; wi < fridays.length; wi++) {
+    const friday = fridays[wi]
+    const existing = data.weeks[friday] || []
+    const byId = new Map(existing.map(e => [e.tenant.id, e]))
+    const out: MonthTenantEntry[] = []
+
+    for (const tenant of roster) {
+      const prior = byId.get(tenant.id)
+      if (prior) {
+        out.push({
+          ...prior,
+          tenant,
+          isVacant: !tenant.isActive,
+          amountDue: tenant.isActive ? weekDueForTenant(tenant, wi, fridays.length) : 0,
+        })
+        continue
+      }
+
+      // Rule 2 — don't shoulder in beside a paid row for the same suite.
+      const suiteAlreadyPaid = existing.some(
+        e => e.tenant.suiteNumber === tenant.suiteNumber && e.amountPaid > 0
+      )
+      if (suiteAlreadyPaid) continue
+
+      const [fresh] = generateWeekEntries([tenant], wi, fridays.length)
+      out.push({ ...fresh, paymentSource: 'none' as PaymentSource })
+    }
+
+    // Rule 1 — carry forward anyone off-roster who still holds money.
+    const rosterIds = new Set(roster.map(t => t.id))
+    for (const e of existing) {
+      if (!rosterIds.has(e.tenant.id) && e.amountPaid > 0) out.push(e)
+    }
+
+    weeks[friday] = out.sort(bySuite)
+  }
+
+  return { ...data, weeks }
+}
+
+/**
+ * Push a roster change through every month already in storage.
+ *
+ * `skipMonthKey` is for the month held in React state — the caller updates that
+ * one itself, and writing it here as well would race the component's own save.
+ * Returns the months that actually changed, so the caller can report honestly.
+ */
+export function reconcileSavedMonths(roster: Tenant[], skipMonthKey?: string): string[] {
+  const touched: string[] = []
+  for (const key of listSavedMonths()) {
+    if (key === skipMonthKey) continue
+    const data = loadMonthData(key)
+    if (!data) continue
+
+    const next = reconcileMonthRoster(data, roster)
+    const before = JSON.stringify(data.weeks)
+    const after = JSON.stringify(next.weeks)
+    if (before === after) continue
+
+    saveMonthData(next)
+    touched.push(key)
+  }
+  return touched
 }

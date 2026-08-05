@@ -17,6 +17,18 @@ export interface CSVMatch {
   csvUnit: string
   dueDate: string // ISO format YYYY-MM-DD (the Friday this belongs to)
   isMonthlyPayment: boolean // true if this is a monthly recurring payment
+  /** Raw TenantCloud statuses behind this match, e.g. ["Paid"] or ["Pending"]. */
+  statuses: string[]
+  /**
+   * Portion of `amount` that TenantCloud has NOT settled yet.
+   *
+   * ACH shows as "Pending" for days after it is initiated. The money is real but
+   * it is not in the bank, and a month-end report sent to an accountant has to
+   * say so — otherwise a pending transfer is indistinguishable from cleared cash.
+   */
+  pendingAmount: number
+  /** Latest "Date paid" seen, ISO. Used to tell on-time from late. */
+  paidDate?: string
 }
 
 export interface CSVMatchResult {
@@ -62,6 +74,7 @@ const COLUMN_MAPPINGS: Record<string, string[]> = {
   tenantName: ['payer/payee', 'tenant name', 'tenant', 'name', 'resident', 'resident name', 'renter'],
   amount: ['paid amount', 'total amount', 'amount', 'payment amount', 'paid', 'total', 'rent paid'],
   paymentDate: ['date paid', 'date created', 'due date', 'date', 'payment date', 'paid date', 'transaction date'],
+  datePaid: ['date paid', 'paid date', 'settled date'],
   dueDate: ['due date', 'due_date'],
   paymentType: ['method of payment', 'payment method', 'method', 'payment type'],
   status: ['status', 'payment status'],
@@ -189,6 +202,7 @@ export function parseAndMatchCSV(
   const dueDateCol = columnMap?.dueDate || findColumn(headers, 'dueDate')
   const typeCol = columnMap?.paymentType || findColumn(headers, 'paymentType')
   const statusCol = columnMap?.status || findColumn(headers, 'status')
+  const paidDateCol = findColumn(headers, 'datePaid')
   const suiteCol = columnMap?.suiteNumber || findColumn(headers, 'suiteNumber')
   const categoryCol = findColumn(headers, 'transactionCategory')
   const txnTypeCol = findColumn(headers, 'transactionType')
@@ -221,6 +235,9 @@ export function parseAndMatchCSV(
     matchMethod: 'suite' | 'exact' | 'fuzzy'
     dueDate: string // ISO format
     isMonthlyPayment: boolean
+    statuses: string[]
+    pendingAmount: number
+    paidDate?: string
   }
   const suitePayments = new Map<string, SuitePaymentData>()
 
@@ -277,6 +294,12 @@ export function parseAndMatchCSV(
     const paymentType = typeCol ? normalizePaymentType(row[typeCol] || '') : 'ACH'
     const isoDate = toISODate(rawDueDate)
 
+    // "Pending" is the one status we keep rather than collapse: the amount counts
+    // as received for reconciliation, but must be reportable as not-yet-cleared.
+    const isPendingRow = rawStatus.toLowerCase() === 'pending'
+    const rawPaidDate = paidDateCol ? row[paidDateCol]?.trim() : ''
+    const rowPaidDate = rawPaidDate && rawPaidDate !== '-' ? toISODate(rawPaidDate) : undefined
+
     // Helper to add/combine a match entry (keyed by tenant + dueDate)
     const addMatch = (tenant: Tenant, matchMethod: 'suite' | 'exact' | 'fuzzy') => {
       const key = `${tenant.id}:${isoDate}`
@@ -284,6 +307,12 @@ export function parseAndMatchCSV(
         const existing = suitePayments.get(key)!
         existing.totalAmount += amount
         existing.rows.push(row)
+        if (isPendingRow) existing.pendingAmount += amount
+        if (!existing.statuses.includes(rawStatus)) existing.statuses.push(rawStatus)
+        // Suite 135 is split across three stylists; keep the latest settlement date.
+        if (rowPaidDate && (!existing.paidDate || rowPaidDate > existing.paidDate)) {
+          existing.paidDate = rowPaidDate
+        }
         if (!existing.names.includes(rawName)) {
           existing.names.push(rawName)
         }
@@ -297,6 +326,9 @@ export function parseAndMatchCSV(
           matchMethod,
           dueDate: isoDate,
           isMonthlyPayment: isMonthlyTxn,
+          statuses: rawStatus ? [rawStatus] : [],
+          pendingAmount: isPendingRow ? amount : 0,
+          paidDate: rowPaidDate,
         })
       }
     }
@@ -365,6 +397,9 @@ export function parseAndMatchCSV(
       csvUnit: data.rows[0]?.[findColumn(parsed.meta.fields || [], 'suiteNumber') || ''] || '',
       dueDate: data.dueDate,
       isMonthlyPayment: data.isMonthlyPayment,
+      statuses: data.statuses,
+      pendingAmount: Math.round(data.pendingAmount * 100) / 100,
+      paidDate: data.paidDate,
     })
   })
 

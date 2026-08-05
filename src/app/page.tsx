@@ -21,7 +21,8 @@ import { buildReminderMessage, buildDetailedReminder, formatPhoneForSMS, LateWee
 import {
   MonthData, MonthTenantEntry, createEmptyMonth, mergeCSVIntoMonth,
   saveMonthData, loadMonthData, calculateMonthlySummary,
-  matchZellePayments, applyZelleMatchesToMonth, ZelleMatch, recalcMonthDues
+  matchZellePayments, applyZelleMatchesToMonth, ZelleMatch, recalcMonthDues,
+  reconcileMonthRoster, reconcileSavedMonths, listSavedMonths
 } from '@/lib/month-data'
 import {
   MonthBook, WeekRef, allocationMonthKeys, loadBook, openWeeksFor, allWeeksFor,
@@ -79,6 +80,9 @@ export default function RentTracker() {
   // Multi-month working set for the scan modal. Deposits routinely pay for weeks
   // in the PREVIOUS month, so the modal must be able to see and write to them.
   const [checkBook, setCheckBook] = useState<MonthBook | null>(null)
+  // Short confirmation after a roster change, so it is visible that earlier
+  // months were updated too rather than silently rewritten.
+  const [rosterNotice, setRosterNotice] = useState<string | null>(null)
 
   // Tenant management state
   const [showTenantPanel, setShowTenantPanel] = useState(false)
@@ -536,12 +540,19 @@ export default function RentTracker() {
       .filter(e => !['free_week', 'comped_week', 'biweekly_off'].includes(e.status))
       .reduce((sum, e) => sum + e.amountDue, 0)
     const totalPaid = active.reduce((sum, e) => sum + e.amountPaid, 0)
+    // Money still in flight at TenantCloud. It is recorded against the week, but
+    // it is not in the bank — so it is subtracted out of COLLECTED and reported
+    // on its own line.
+    const totalPending = active.reduce((sum, e) => sum + (e.pendingAmount || 0), 0)
+    const cleared = Math.round((totalPaid - totalPending) * 100) / 100
 
     return {
       totalDue: weeklyDue,
-      totalPaid,
-      outstanding: weeklyDue - totalPaid,
-      collectionRate: weeklyDue > 0 ? ((totalPaid / weeklyDue) * 100).toFixed(1) : '0.0',
+      totalPaid: cleared,
+      totalPending,
+      pendingCount: active.filter(e => (e.pendingAmount || 0) > 0).length,
+      outstanding: Math.round((weeklyDue - cleared - totalPending) * 100) / 100,
+      collectionRate: weeklyDue > 0 ? ((cleared / weeklyDue) * 100).toFixed(1) : '0.0',
       paid: active.filter(e => e.status === 'paid').length,
       late: active.filter(e => e.status === 'late').length,
       partial: active.filter(e => e.status === 'partial').length,
@@ -583,6 +594,8 @@ export default function RentTracker() {
       entries: currentWeekEntries,
       totalDue: stats.totalDue,
       totalPaid: stats.totalPaid,
+      totalPending: stats.totalPending,
+      dueDate: activeTab,
     })
     doc.save(`Salon_Boutique_${activeTab}.pdf`)
   }, [activeTab, currentWeekEntries, stats])
@@ -841,19 +854,20 @@ export default function RentTracker() {
   const handleSaveTenant = useCallback((data: TenantFormData) => {
     if (tenantPanelMode === 'add') {
       const updated = createTenant(tenants, data)
+      const roster = getActiveTenants(updated)
       setTenants(updated)
-      // Rebuild month data to include new tenant
-      const newMonthData = createEmptyMonth(monthKey, getActiveTenants(updated))
-      // Merge existing payment data
-      const mergedWeeks: Record<string, MonthTenantEntry[]> = {}
-      for (const [friday, entries] of Object.entries(newMonthData.weeks)) {
-        const existingEntries = monthData.weeks[friday] || []
-        mergedWeeks[friday] = entries.map(newEntry => {
-          const existing = existingEntries.find(e => e.tenant.id === newEntry.tenant.id)
-          return existing || newEntry
-        })
-      }
-      setMonthData(prev => ({ ...prev, weeks: mergedWeeks }))
+
+      // The month on screen...
+      setMonthData(prev => reconcileMonthRoster(prev, roster))
+      // ...and every month already on disk. Moving a tenant into a vacant suite
+      // used to touch only the month being viewed, so an earlier month still
+      // showed the suite as Vacant and their past payments had nowhere to go.
+      const touched = reconcileSavedMonths(roster, monthData.monthKey)
+      setRosterNotice(
+        touched.length > 0
+          ? `${data.name} added to ${monthLabel(monthData.monthKey)} and ${touched.length} earlier month${touched.length !== 1 ? 's' : ''}.`
+          : `${data.name} added to ${monthLabel(monthData.monthKey)}.`
+      )
     } else if (selectedTenantId) {
       const updated = updateTenant(tenants, selectedTenantId, data)
       setTenants(updated)
@@ -873,6 +887,14 @@ export default function RentTracker() {
         // figure, because amountDue is frozen in when the month is built.
         return recalcMonthDues({ ...prev, weeks: newWeeks }, updated)
       })
+      // Rent and name changes have to reach the stored months too, or they only
+      // apply to whichever month happened to be open when Save was pressed.
+      const roster = getActiveTenants(updated)
+      for (const key of listSavedMonths()) {
+        if (key === monthData.monthKey) continue
+        const stored = loadMonthData(key)
+        if (stored) saveMonthData(recalcMonthDues(reconcileMonthRoster(stored, roster), roster))
+      }
     }
     setShowTenantPanel(false)
   }, [tenantPanelMode, selectedTenantId, tenants, monthKey, monthData])
@@ -915,9 +937,19 @@ export default function RentTracker() {
       return { ...prev, weeks: newWeeks }
     })
 
+    // Later months must show the suite as vacant too, otherwise a tenant who has
+    // moved out keeps accruing rent in any month already built ahead of today.
+    const roster = getActiveTenants(updated)
+    for (const key of listSavedMonths()) {
+      if (key === monthData.monthKey) continue
+      if (key < moveOutDate.slice(0, 7)) continue // history stays as it happened
+      const stored = loadMonthData(key)
+      if (stored) saveMonthData(reconcileMonthRoster(stored, roster))
+    }
+
     setShowMoveOutConfirm(null)
     setMoveOutDate('')
-  }, [tenants, moveOutDate])
+  }, [tenants, moveOutDate, monthData.monthKey])
 
   const sortedFridays = useMemo(() => Object.keys(monthData.weeks).sort(), [monthData.weeks])
   const isMonthlySummaryTab = activeTab === 'monthly-summary'
@@ -1100,6 +1132,22 @@ export default function RentTracker() {
         </div>
       </header>
 
+      {rosterNotice && (
+        <div className="fixed bottom-4 right-4 z-50 max-w-sm rounded-lg border border-green-300 bg-green-50 shadow-lg px-4 py-3">
+          <div className="flex items-start gap-2">
+            <Check size={16} className="text-green-700 mt-0.5 shrink-0" />
+            <p className="text-sm text-green-900">{rosterNotice}</p>
+            <button
+              onClick={() => setRosterNotice(null)}
+              className="ml-auto text-green-700 hover:text-green-900 shrink-0"
+              aria-label="Dismiss"
+            >
+              <X size={14} />
+            </button>
+          </div>
+        </div>
+      )}
+
       <div className="max-w-[1400px] mx-auto px-4 py-4">
         {isMonthlySummaryTab ? (
           <MonthlySummaryView monthData={monthData} />
@@ -1122,6 +1170,13 @@ export default function RentTracker() {
             <div className="bg-white rounded-lg border border-gray-200 p-3 mb-4 flex items-center gap-6">
               <SummaryItem label="Due" value={formatCurrency(stats.totalDue)} />
               <SummaryItem label="Collected" value={formatCurrency(stats.totalPaid)} valueColor="text-green-700" />
+              {stats.totalPending > 0 && (
+                <SummaryItem
+                  label={`Pending (${stats.pendingCount})`}
+                  value={formatCurrency(stats.totalPending)}
+                  valueColor="text-amber-600"
+                />
+              )}
               <SummaryItem label="Outstanding" value={formatCurrency(stats.outstanding)} valueColor="text-red-600" />
               <SummaryItem label="Rate" value={`${stats.collectionRate}%`} />
               <div className="flex-1 bg-gray-100 rounded-full h-3 overflow-hidden">
@@ -2591,7 +2646,16 @@ function EntryRow({
       </td>
 
       <td className="px-3 py-1.5 text-[11px] text-gray-500">
-        {!isVacant && entry.amountPaid > 0 && (entry.confirmation || '')}
+        {!isVacant && entry.amountPaid > 0 && (
+          (entry.pendingAmount || 0) > 0 ? (
+            <span
+              className="text-[10px] font-medium px-1.5 py-0.5 rounded border bg-amber-50 text-amber-700 border-amber-300"
+              title={`${formatCurrency(entry.pendingAmount || 0)} has not cleared the bank yet`}
+            >
+              Pending
+            </span>
+          ) : (entry.confirmation || '')
+        )}
       </td>
 
       <td className="px-3 py-1.5">

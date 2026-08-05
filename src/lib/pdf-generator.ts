@@ -7,7 +7,17 @@ interface ReportData {
   weekLabel: string
   entries: TenantWeekEntry[]
   totalDue: number
+  /** Cleared cash only — pending ACH is reported separately. */
   totalPaid: number
+  totalPending?: number
+  /** The Friday this week was due, ISO. Used to tell on-time from late. */
+  dueDate?: string
+}
+
+/** True when the money settled after the Friday it was due. */
+function settledLate(entry: TenantWeekEntry, dueDate?: string): boolean {
+  if (!dueDate || !entry.paidDate || entry.amountPaid <= 0) return false
+  return entry.paidDate > dueDate
 }
 
 export function generateWeeklyPDF(data: ReportData): jsPDF {
@@ -24,13 +34,31 @@ export function generateWeeklyPDF(data: ReportData): jsPDF {
   doc.setFont('helvetica', 'normal')
   doc.text(data.weekLabel, pageWidth / 2, 58, { align: 'center' })
 
+  // "As of" stamp. Late payments back-fill into earlier weeks, so two reports for
+  // the same week can legitimately differ — the accountant needs to know which
+  // snapshot she is holding.
+  const now = new Date()
+  const asOf = `${now.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })} at ${now.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })}`
+  doc.setFontSize(9)
+  doc.setTextColor(107, 114, 128)
+  doc.text(`Figures as of ${asOf}`, pageWidth / 2, 72, { align: 'center' })
+  doc.setTextColor(0, 0, 0)
+
   // Summary line
+  const pendingTotal = data.totalPending || 0
+  const outstanding = Math.round((data.totalDue - data.totalPaid - pendingTotal) * 100) / 100
   const collectionRate = data.totalDue > 0 ? ((data.totalPaid / data.totalDue) * 100).toFixed(1) : '0.0'
   doc.setFontSize(10)
   doc.text(
-    `Due: ${formatCurrency(data.totalDue)}  |  Collected: ${formatCurrency(data.totalPaid)}  |  Outstanding: ${formatCurrency(data.totalDue - data.totalPaid)}  |  Rate: ${collectionRate}%`,
+    [
+      `Due: ${formatCurrency(data.totalDue)}`,
+      `Collected (cleared): ${formatCurrency(data.totalPaid)}`,
+      ...(pendingTotal > 0 ? [`Pending: ${formatCurrency(pendingTotal)}`] : []),
+      `Outstanding: ${formatCurrency(outstanding)}`,
+      `Rate: ${collectionRate}%`,
+    ].join('  |  '),
     pageWidth / 2,
-    76,
+    90,
     { align: 'center' }
   )
 
@@ -60,15 +88,19 @@ export function generateWeeklyPDF(data: ReportData): jsPDF {
       paidDisplay,
       entry.paymentType || '',
       statusLabel,
-      entry.confirmation || '',
+      (entry.pendingAmount || 0) > 0
+        ? 'PENDING'
+        : settledLate(entry, data.dueDate)
+          ? `Late (${entry.paidDate})`
+          : entry.confirmation || '',
       entry.checkNumber || '',
       entry.notes || '',
     ]
   })
 
   autoTable(doc, {
-    startY: 90,
-    head: [['Suite', 'Tenant Name', 'Rent Due', 'Rent Paid', 'Pay Type', 'Status', 'Confirm', 'Check #', 'Notes']],
+    startY: 104,
+    head: [['Suite', 'Tenant Name', 'Rent Due', 'Rent Paid', 'Pay Type', 'Status', 'Confirm / Timing', 'Check #', 'Notes']],
     body: tableData,
     styles: {
       fontSize: 8,
@@ -93,6 +125,16 @@ export function generateWeeklyPDF(data: ReportData): jsPDF {
     },
     didParseCell: function (data) {
       // Color code status column
+      // Make PENDING and Late unmissable in the Confirm column.
+      if (data.column.index === 6 && data.section === 'body') {
+        const val = String(data.cell.raw || '')
+        if (val === 'PENDING') {
+          data.cell.styles.textColor = [180, 83, 9]
+          data.cell.styles.fontStyle = 'bold'
+        } else if (val.startsWith('Late')) {
+          data.cell.styles.textColor = [161, 98, 7]
+        }
+      }
       if (data.column.index === 5 && data.section === 'body') {
         const val = String(data.cell.raw)
         if (val === 'Paid') {
@@ -115,6 +157,53 @@ export function generateWeeklyPDF(data: ReportData): jsPDF {
     },
     // No foot — summary is at the top to avoid duplicate totals
   })
+
+  // Pending appendix — the reason this report exists in the first place. If ACH
+  // is still in flight when it is sent, the accountant should not have to hunt
+  // through the table to find which lines are not yet money in the bank.
+  const pendingRows = data.entries.filter(e => (e.pendingAmount || 0) > 0)
+  if (pendingRows.length > 0) {
+    const y = ((doc as any).lastAutoTable?.finalY || 400) + 24
+    doc.setFontSize(11)
+    doc.setFont('helvetica', 'bold')
+    doc.setTextColor(180, 83, 9)
+    doc.text(`Pending payments — not yet cleared as of ${asOf}`, 40, y)
+    doc.setTextColor(0, 0, 0)
+
+    autoTable(doc, {
+      startY: y + 8,
+      head: [['Suite', 'Tenant Name', 'Amount Pending', 'Method', 'Expected Settlement']],
+      body: pendingRows.map(e => [
+        e.tenant.suiteNumber,
+        e.tenant.name,
+        formatCurrency(e.pendingAmount || 0),
+        e.paymentType || 'ACH',
+        e.paidDate || '—',
+      ]),
+      styles: { fontSize: 8, cellPadding: 3 },
+      headStyles: {
+        fillColor: [180, 83, 9],
+        textColor: [255, 255, 255],
+        fontStyle: 'bold',
+        fontSize: 8,
+      },
+      columnStyles: {
+        0: { cellWidth: 50 },
+        1: { cellWidth: 140 },
+        2: { cellWidth: 90, halign: 'right' },
+        3: { cellWidth: 60 },
+        4: { cellWidth: 110 },
+      },
+      foot: [[
+        '',
+        'Total pending',
+        formatCurrency(pendingRows.reduce((sum, e) => sum + (e.pendingAmount || 0), 0)),
+        '',
+        '',
+      ]],
+      footStyles: { fillColor: [254, 243, 199], textColor: [120, 53, 15], fontStyle: 'bold', fontSize: 8 },
+    })
+  }
 
   // Footer
   const finalY = (doc as any).lastAutoTable?.finalY || 500
