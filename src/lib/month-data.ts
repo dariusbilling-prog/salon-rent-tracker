@@ -134,6 +134,12 @@ export function mergeCSVIntoMonth(
   for (const match of matches) {
     if (!match.isMonthlyPayment) continue
 
+    // A monthly payment belongs to ONE month. Without this, importing a July
+    // export while the app happened to be showing August spread July's monthly
+    // rent across August — the weekly rows silently went nowhere (no matching
+    // Fridays) while the monthly ones landed in the wrong month entirely.
+    if (match.dueDate.slice(0, 7) !== monthData.monthKey) continue
+
     let remaining = Math.round(match.amount * 100) / 100
     const pendingShare = match.amount > 0 ? (match.pendingAmount || 0) / match.amount : 0
 

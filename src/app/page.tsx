@@ -485,9 +485,20 @@ export default function RentTracker() {
             updated.status = 'paid'
           } else if (paid > 0) {
             updated.status = 'partial'
+          } else {
+            // Clearing a figure has to clear the status with it. Previously a
+            // week zeroed back to $0.00 kept reading "Paid", which is the worst
+            // possible way to be wrong about rent.
+            const passed = activeTab ? new Date(activeTab + 'T00:00:00') < new Date() : false
+            updated.status = passed ? 'late' : 'unpaid'
+            updated.paymentType = undefined
+            updated.confirmation = undefined
+            updated.pendingAmount = undefined
           }
+          // Zeroing is a correction, not a hand-entered payment — leaving it
+          // marked "manual" would make a later CSV refresh skip the row forever.
           if (markManual) {
-            updated.paymentSource = 'manual'
+            updated.paymentSource = paid > 0 ? 'manual' : 'none'
           }
         }
 
