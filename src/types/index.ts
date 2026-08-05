@@ -20,6 +20,13 @@ export interface Tenant {
   secondName?: string
   suiteNumber: string
   weeklyRent: number
+  /**
+   * Flat amount charged per calendar month for tenants on `billingFrequency: 'monthly'`.
+   * When set it is the source of truth for what the tenant owes that month, and it is
+   * split across however many Fridays the month has (4 or 5). Leave undefined for
+   * weekly/bi-weekly tenants, where `weeklyRent` is the source of truth.
+   */
+  monthlyRent?: number
   billingFrequency: BillingFrequency
   defaultPayType?: PaymentType
   phone?: string

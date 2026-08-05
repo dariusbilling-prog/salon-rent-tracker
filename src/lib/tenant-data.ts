@@ -2,6 +2,7 @@
 // This will be replaced by database reads once Supabase is connected
 
 import { Tenant, TenantWeekEntry, WeekStatus } from '@/types'
+import { monthlyWeekShare } from './utils'
 
 export const TENANTS: Tenant[] = [
   { id: '1', name: 'Brenda Sanchez', suiteNumber: '101/102', weeklyRent: 425, billingFrequency: 'weekly', isActive: true, phone: '' },
@@ -38,8 +39,33 @@ export const TENANTS: Tenant[] = [
   { id: '32', name: 'Stephany', suiteNumber: '136', weeklyRent: 265, billingFrequency: 'weekly', isActive: true, phone: '' },
 ]
 
-// Generate initial week entries from tenant data
-export function generateWeekEntries(tenants: Tenant[]): TenantWeekEntry[] {
+/**
+ * What one tenant owes for a single week of a month.
+ *
+ * Weekly and bi-weekly tenants owe `weeklyRent`. Monthly tenants owe an equal
+ * share of `monthlyRent` — so a 5-Friday month costs them the same as a 4-Friday
+ * one. Monthly tenants without a `monthlyRent` set fall back to `weeklyRent`,
+ * which preserves the old (over-charging) behaviour until the amount is filled in.
+ */
+export function weekDueForTenant(tenant: Tenant, weekIndex = 0, weekCount = 1): number {
+  if (
+    tenant.billingFrequency === 'monthly' &&
+    typeof tenant.monthlyRent === 'number' &&
+    tenant.monthlyRent > 0
+  ) {
+    return monthlyWeekShare(tenant.monthlyRent, weekCount, weekIndex)
+  }
+  return tenant.weeklyRent
+}
+
+// Generate initial week entries from tenant data.
+// `weekIndex` / `weekCount` position this week inside its month so monthly
+// tenants can be billed a flat monthly amount rather than weeklyRent x weeks.
+export function generateWeekEntries(
+  tenants: Tenant[],
+  weekIndex = 0,
+  weekCount = 1
+): TenantWeekEntry[] {
   return tenants.map(tenant => {
     const isVacant = !tenant.isActive
     let status: WeekStatus = 'unpaid'
@@ -57,7 +83,7 @@ export function generateWeekEntries(tenants: Tenant[]): TenantWeekEntry[] {
     return {
       tenant,
       status,
-      amountDue: isVacant ? 0 : tenant.weeklyRent,
+      amountDue: isVacant ? 0 : weekDueForTenant(tenant, weekIndex, weekCount),
       amountPaid: 0,
       payments: [],
       paymentType: undefined,

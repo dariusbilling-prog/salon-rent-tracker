@@ -13,7 +13,7 @@ import { TENANTS as DEFAULT_TENANTS } from '@/lib/tenant-data'
 import {
   formatCurrency, getStatusLabel, getStatusColor, cn,
   getCurrentMonthKey, monthLabel, addMonths, fridayShortLabel, fridayFullLabel,
-  getFridaysInMonth
+  getFridaysInMonth, isNearSuite
 } from '@/lib/utils'
 import { generateWeeklyPDF } from '@/lib/pdf-generator'
 import { parseAndMatchCSV, CSVMatchResult } from '@/lib/csv-parser'
@@ -21,8 +21,13 @@ import { buildReminderMessage, buildDetailedReminder, formatPhoneForSMS, LateWee
 import {
   MonthData, MonthTenantEntry, createEmptyMonth, mergeCSVIntoMonth,
   saveMonthData, loadMonthData, calculateMonthlySummary,
-  matchZellePayments, applyZelleMatchesToMonth, ZelleMatch
+  matchZellePayments, applyZelleMatchesToMonth, ZelleMatch, recalcMonthDues
 } from '@/lib/month-data'
+import {
+  MonthBook, WeekRef, allocationMonthKeys, loadBook, openWeeksFor, allWeeksFor,
+  planAllocation, applyPaymentAcross, monthKeyOf, owedOn, round2,
+  matchTenantBySuite, suiteAlternatives
+} from '@/lib/payment-allocation'
 import { DepositSlipResult } from '@/lib/check-scanner'
 import {
   loadTenants, saveTenants, createTenant, updateTenant, archiveTenant,
@@ -71,6 +76,9 @@ export default function RentTracker() {
   const [checkResults, setCheckResults] = useState<DepositSlipResult[] | null>(null)
   const [checkError, setCheckError] = useState<string | null>(null)
   const [checkEdits, setCheckEdits] = useState<Record<string, { suiteNumber?: string; amount?: string; checkNumber?: string; fridayKey?: string; fridayKeys?: string[] }>>({})
+  // Multi-month working set for the scan modal. Deposits routinely pay for weeks
+  // in the PREVIOUS month, so the modal must be able to see and write to them.
+  const [checkBook, setCheckBook] = useState<MonthBook | null>(null)
 
   // Tenant management state
   const [showTenantPanel, setShowTenantPanel] = useState(false)
@@ -93,7 +101,10 @@ export default function RentTracker() {
   // Load month data from localStorage when month changes
   useEffect(() => {
     const loaded = loadMonthData(monthKey)
-    const data = loaded || createEmptyMonth(monthKey, activeTenants)
+    // Re-price on load so stored months pick up any rent change made since.
+    const data = loaded
+      ? recalcMonthDues(loaded, activeTenants)
+      : createEmptyMonth(monthKey, activeTenants)
     setMonthData(data)
     const firstFriday = Object.keys(data.weeks).sort()[0]
     setActiveTab(firstFriday || '')
@@ -119,7 +130,7 @@ export default function RentTracker() {
         setTenants(loadTenants())
         setCredits(loadCredits())
         const loaded = loadMonthData(monthKey)
-        if (loaded) setMonthData(loaded)
+        if (loaded) setMonthData(recalcMonthDues(loaded, getActiveTenants(loadTenants())))
       }
     })()
     return () => {
@@ -273,6 +284,44 @@ export default function RentTracker() {
         return
       }
 
+      // Build the multi-month working set and pre-assign every entry to the
+      // tenant's oldest unpaid weeks. Two reasons this happens here and not at
+      // render time:
+      //   1. What the modal SHOWS is now literally what gets applied. Previously
+      //      the week dropdown displayed a default it never stored, so leaving it
+      //      alone silently posted to whatever week tab happened to be open.
+      //   2. It is the answer to "which week is this for?" — the one question a
+      //      deposit slip can never answer, since it carries no dates.
+      const book = loadBook(allocationMonthKeys(monthKey), activeTenants, monthData)
+      const seeded: Record<string, { suiteNumber?: string; amount?: string; checkNumber?: string; fridayKey?: string; fridayKeys?: string[] }> = {}
+
+      // Plan entries against a running copy so two checks from the same tenant in
+      // one batch do not both target the same week.
+      const projected: Record<string, number> = {}
+      for (const result of data.results as DepositSlipResult[]) {
+        result.entries.forEach((entry, entryIdx) => {
+          const suite = entry.suiteNumber
+          const amountVal = entry.amount || 0
+          if (!suite || amountVal <= 0) return
+          const tenant = matchTenantBySuite(activeTenants, suite)
+          if (!tenant) return
+
+          const open = openWeeksFor(book, tenant.id)
+          const alreadyTaken = projected[tenant.id] || 0
+          const remainingWeeks = open.slice(alreadyTaken)
+          const plan = planAllocation(book, tenant.id, amountVal, remainingWeeks)
+          if (plan.weeks.length === 0) return
+
+          projected[tenant.id] = alreadyTaken + plan.weeks.length
+          seeded[`${result.imageIndex}-${entryIdx}`] = {
+            fridayKeys: plan.weeks.map(w => w.friday),
+            fridayKey: plan.weeks[0].friday,
+          }
+        })
+      }
+
+      setCheckBook(book)
+      setCheckEdits(seeded)
       setCheckResults(data.results)
     } catch (err) {
       setCheckError('Error scanning checks: ' + (err as Error).message)
@@ -280,88 +329,119 @@ export default function RentTracker() {
       setCheckScanning(false)
       if (checkInputRef.current) checkInputRef.current.value = ''
     }
-  }, [])
+  }, [monthKey, monthData, activeTenants])
 
-  // Apply scanned/edited check data to the month (supports multi-week payments + credits)
+  /**
+   * Commit the reviewed deposit slip.
+   *
+   * Rewritten because the previous version had three separate money bugs:
+   *  - it could only write to the month on screen, so cheques for last month's
+   *    Fridays landed on the wrong week;
+   *  - it ASSIGNED amountPaid rather than adding, so a second cheque hitting a
+   *    funded week erased the first;
+   *  - it accumulated credits inside a setState updater and then read the value
+   *    back outside it, so most leftovers were dropped.
+   *
+   * Now: pure allocation over a multi-month book, then one write at the end.
+   */
   const handleApplyChecks = useCallback(() => {
-    if (!checkResults) return
-    const fridays = Object.keys(monthData.weeks).sort()
+    if (!checkResults || !checkBook) return
+
+    let book = checkBook
     let newCredits = { ...credits }
 
-    setMonthData(prev => {
-      const newWeeks = { ...prev.weeks }
+    for (const result of checkResults) {
+      for (let entryIdx = 0; entryIdx < result.entries.length; entryIdx++) {
+        const entry = result.entries[entryIdx]
+        const editKey = `${result.imageIndex}-${entryIdx}`
+        const edits = checkEdits[editKey] || {}
 
-      for (const result of checkResults) {
-        for (let entryIdx = 0; entryIdx < result.entries.length; entryIdx++) {
-          const entry = result.entries[entryIdx]
-          const editKey = `${result.imageIndex}-${entryIdx}`
-          const edits = checkEdits[editKey] || {}
+        const suiteNum = edits.suiteNumber ?? entry.suiteNumber
+        const amountStr = edits.amount ?? (entry.amount != null ? String(entry.amount) : '')
+        const checkNum = edits.checkNumber ?? entry.checkNumber
+        const totalAmount = parseFloat(amountStr)
 
-          const suiteNum = edits.suiteNumber ?? entry.suiteNumber
-          const amountStr = edits.amount ?? (entry.amount != null ? String(entry.amount) : '')
-          const checkNum = edits.checkNumber ?? entry.checkNumber
-          const totalAmount = parseFloat(amountStr)
+        if (!suiteNum || isNaN(totalAmount) || totalAmount <= 0) continue
 
-          if (!suiteNum || isNaN(totalAmount) || totalAmount <= 0) continue
+        const tenant = matchTenantBySuite(activeTenants, suiteNum)
+        if (!tenant) continue
 
-          const tenant = activeTenants.find(t =>
-            t.suiteNumber === suiteNum ||
-            t.suiteNumber.includes(suiteNum) ||
-            suiteNum.includes(t.suiteNumber)
-          )
-          if (!tenant) continue
+        // Only the weeks actually shown as selected. No implicit fallback to the
+        // open tab — that fallback is exactly what silently mis-posted payments.
+        const chosen = edits.fridayKeys && edits.fridayKeys.length > 0
+          ? edits.fridayKeys
+          : edits.fridayKey
+            ? [edits.fridayKey]
+            : []
 
-          const selectedWeeks = edits.fridayKeys && edits.fridayKeys.length > 0
-            ? edits.fridayKeys
-            : [edits.fridayKey || (activeTab !== 'monthly-summary' ? activeTab : fridays[0])]
+        const targets: WeekRef[] = chosen
+          .slice()
+          .sort()
+          .map(f => ({ monthKey: monthKeyOf(f), friday: f }))
+          .filter(ref => !!book[ref.monthKey]?.weeks[ref.friday])
 
-          const weeklyRent = tenant.weeklyRent
-          let remaining = totalAmount
+        const res = applyPaymentAcross(book, targets, tenant.id, totalAmount, {
+          paymentType: 'Check',
+          checkNumber: checkNum || undefined,
+          confirmation: 'Check',
+        })
 
-          for (const targetFriday of selectedWeeks) {
-            if (!targetFriday || !newWeeks[targetFriday]) continue
-
-            const entries = [...newWeeks[targetFriday]]
-            const idx = entries.findIndex(e => e.tenant.id === tenant.id)
-            if (idx === -1) continue
-
-            const applyAmount = Math.min(remaining, weeklyRent)
-            remaining -= applyAmount
-
-            entries[idx] = {
-              ...entries[idx],
-              amountPaid: applyAmount,
-              paymentType: 'Check',
-              status: applyAmount >= entries[idx].amountDue ? 'paid' : 'partial',
-              checkNumber: checkNum || undefined,
-              confirmation: 'Check',
-              paymentSource: 'manual',
-            }
-            newWeeks[targetFriday] = entries
-          }
-
-          // If there's leftover after applying to all selected weeks, store as credit
-          if (remaining > 0.01) {
-            newCredits = addCredit(newCredits, tenant.id, remaining)
-          }
+        book = res.book
+        if (res.leftover > 0.005) {
+          newCredits = addCredit(newCredits, tenant.id, res.leftover)
         }
       }
+    }
 
-      return { ...prev, weeks: newWeeks }
-    })
+    // Persist. The month on screen goes through React state; the others are
+    // written straight to storage (and mirrored to the cloud by saveMonthData).
+    for (const [key, data] of Object.entries(book)) {
+      if (data === checkBook[key]) continue
+      if (key === monthData.monthKey) setMonthData(data)
+      else saveMonthData(data)
+    }
 
     setCredits(newCredits)
+    saveCredits(newCredits)
+    setCheckBook(null)
     setShowCheckModal(false)
     setCheckResults(null)
     setCheckEdits({})
-  }, [checkResults, checkEdits, monthData, activeTab, credits, activeTenants])
+  }, [checkResults, checkBook, checkEdits, credits, activeTenants, monthData.monthKey])
 
   const updateCheckEdit = useCallback((editKey: string, field: string, value: string) => {
-    setCheckEdits(prev => ({
-      ...prev,
-      [editKey]: { ...prev[editKey], [field]: value },
-    }))
-  }, [])
+    setCheckEdits(prev => {
+      const next = { ...prev, [editKey]: { ...prev[editKey], [field]: value } }
+
+      // Correcting a suite or an amount invalidates the week plan that was built
+      // from the old values — re-plan so the selection on screen stays the thing
+      // that will actually be applied.
+      if ((field === 'suiteNumber' || field === 'amount') && checkBook && checkResults) {
+        const sepIdx = editKey.indexOf('-')
+        const imgIdx = Number(editKey.slice(0, sepIdx))
+        const entIdx = Number(editKey.slice(sepIdx + 1))
+        const scanned = checkResults.find(r => r.imageIndex === imgIdx)?.entries[entIdx]
+
+        const suite = next[editKey].suiteNumber ?? scanned?.suiteNumber ?? ''
+        const rawAmt = next[editKey].amount ?? (scanned?.amount != null ? String(scanned.amount) : '')
+        const amt = parseFloat(rawAmt) || 0
+        const tenant = matchTenantBySuite(activeTenants, suite)
+
+        if (tenant && amt > 0) {
+          const plan = planAllocation(checkBook, tenant.id, amt)
+          next[editKey] = {
+            ...next[editKey],
+            fridayKeys: plan.weeks.map(w => w.friday),
+            fridayKey: plan.weeks[0]?.friday,
+          }
+        } else {
+          next[editKey] = { ...next[editKey], fridayKeys: [], fridayKey: undefined }
+        }
+      }
+
+      return next
+    })
+  }, [checkBook, checkResults, activeTenants])
 
   const currentWeekEntries: MonthTenantEntry[] = useMemo(() => {
     if (activeTab === 'monthly-summary' || !activeTab) return []
@@ -548,41 +628,28 @@ export default function RentTracker() {
 
     // Multi-week: apply across selected weeks
     if (manualForm.multiWeekKeys.length > 1 && weeklyRent > 0) {
-      const fridays = Object.keys(monthData.weeks).sort()
-      let remaining = amount
+      // Same engine as the deposit-slip path. The old code here assigned
+      // `amountPaid = applyAmount` (wiping anything already on the week) and then
+      // computed the leftover as `selectedWeeks * weeklyRent`, which is wrong the
+      // moment a week was partly paid or the tenant is billed monthly.
+      const book: MonthBook = { [monthData.monthKey]: monthData }
+      const targets: WeekRef[] = manualForm.multiWeekKeys
+        .slice()
+        .sort()
+        .filter(f => !!monthData.weeks[f])
+        .map(f => ({ monthKey: monthData.monthKey, friday: f }))
 
-      setMonthData(prev => {
-        const newWeeks = { ...prev.weeks }
-
-        for (const fridayKey of manualForm.multiWeekKeys) {
-          if (!newWeeks[fridayKey] || !fridays.includes(fridayKey)) continue
-          const entries = [...newWeeks[fridayKey]]
-          const idx = entries.findIndex(e => e.tenant.id === manualForm.tenantId)
-          if (idx === -1) continue
-
-          const applyAmount = Math.min(remaining, weeklyRent)
-          remaining -= applyAmount
-
-          entries[idx] = {
-            ...entries[idx],
-            amountPaid: applyAmount,
-            paymentType: manualForm.paymentType,
-            status: applyAmount >= entries[idx].amountDue ? 'paid' : 'partial',
-            checkNumber: manualForm.checkNumber || undefined,
-            notes: manualForm.notes || undefined,
-            confirmation,
-            paymentSource: 'manual',
-          }
-          newWeeks[fridayKey] = entries
-        }
-        return { ...prev, weeks: newWeeks }
+      const res = applyPaymentAcross(book, targets, manualForm.tenantId, amount, {
+        paymentType: manualForm.paymentType,
+        checkNumber: manualForm.checkNumber || undefined,
+        notes: manualForm.notes || undefined,
+        confirmation,
       })
 
-      // Store any leftover as credit
-      const totalApplied = manualForm.multiWeekKeys.length * weeklyRent
-      const leftover = amount - totalApplied
-      if (leftover > 0.01) {
-        setCredits(prev => addCredit(prev, manualForm.tenantId, leftover))
+      setMonthData(res.book[monthData.monthKey])
+
+      if (res.leftover > 0.005) {
+        setCredits(addCredit(credits, manualForm.tenantId, res.leftover))
       }
     } else {
       // Single-week
@@ -800,7 +867,11 @@ export default function RentTracker() {
             return updatedTenant ? { ...e, tenant: updatedTenant } : e
           })
         }
-        return { ...prev, weeks: newWeeks }
+        // Re-price the month from the saved tenants. Without this, a rent change
+        // (especially giving a monthly tenant a real monthlyRent) only affects
+        // months created afterwards — every existing week keeps billing the old
+        // figure, because amountDue is frozen in when the month is built.
+        return recalcMonthDues({ ...prev, weeks: newWeeks }, updated)
       })
     }
     setShowTenantPanel(false)
@@ -851,36 +922,44 @@ export default function RentTracker() {
   const sortedFridays = useMemo(() => Object.keys(monthData.weeks).sort(), [monthData.weeks])
   const isMonthlySummaryTab = activeTab === 'monthly-summary'
 
-  // Check if all multi-week entries in checks are fully allocated
-  const allCheckMultiWeeksAllocated = useMemo(() => {
-    if (!checkResults) return true
+  /**
+   * Entries that still have nowhere to put their money.
+   *
+   * The old gate demanded that the number of selected weeks exactly equal
+   * `floor(amount / weeklyRent)` and, when that failed, disabled the Apply button
+   * with a single generic label. With seven entries on a slip there was no way to
+   * tell which one was holding it up. Now every blocker is named.
+   */
+  const checkBlockers = useMemo(() => {
+    const out: Array<{ editKey: string; label: string; reason: string }> = []
+    if (!checkResults) return out
+
     for (const result of checkResults) {
-      for (let entryIdx = 0; entryIdx < result.entries.length; entryIdx++) {
-        const entry = result.entries[entryIdx]
+      result.entries.forEach((entry, entryIdx) => {
         const editKey = `${result.imageIndex}-${entryIdx}`
         const edits = checkEdits[editKey] || {}
         const suite = edits.suiteNumber ?? entry.suiteNumber
-        const amount = edits.amount ?? (entry.amount != null ? String(entry.amount) : '')
-        const amountVal = parseFloat(amount) || 0
+        const amountVal = parseFloat(edits.amount ?? (entry.amount != null ? String(entry.amount) : '')) || 0
 
-        if (!suite || amountVal <= 0) continue
+        // Blank rows are simply skipped on apply, not blockers.
+        if (!suite || amountVal <= 0) return
 
-        const matchedTenant = activeTenants.find(t =>
-          t.suiteNumber === suite ||
-          t.suiteNumber.includes(suite) ||
-          (suite && suite.includes(t.suiteNumber))
-        )
-        if (!matchedTenant) continue
-
-        const weeklyRent = matchedTenant.weeklyRent
-        if (weeklyRent > 0 && amountVal > weeklyRent) {
-          const weeksNeeded = Math.floor(amountVal / weeklyRent)
-          const selectedKeys = edits.fridayKeys || []
-          if (selectedKeys.length !== weeksNeeded) return false
+        const label = `Entry ${entryIdx + 1} — suite ${suite}, ${formatCurrency(amountVal)}`
+        const tenant = matchTenantBySuite(activeTenants, suite)
+        if (!tenant) {
+          out.push({ editKey, label, reason: 'no tenant at this suite' })
+          return
         }
-      }
+
+        const selected = edits.fridayKeys && edits.fridayKeys.length > 0
+          ? edits.fridayKeys
+          : edits.fridayKey ? [edits.fridayKey] : []
+        if (selected.length === 0) {
+          out.push({ editKey, label, reason: 'pick at least one week' })
+        }
+      })
     }
-    return true
+    return out
   }, [checkResults, checkEdits, activeTenants])
 
   // Manual entry: check if multi-week is fully allocated
@@ -1608,26 +1687,37 @@ export default function RentTracker() {
                           const suite = edits.suiteNumber ?? entry.suiteNumber ?? ''
                           const amount = edits.amount ?? (entry.amount != null ? String(entry.amount) : '')
                           const checkNum = edits.checkNumber ?? entry.checkNumber ?? ''
-                          const fridayKey = edits.fridayKey || (activeTab !== 'monthly-summary' ? activeTab : '')
-                          const sortedFri = Object.keys(monthData.weeks).sort()
-
-                          const matchedTenant = activeTenants.find(t =>
-                            t.suiteNumber === suite ||
-                            t.suiteNumber.includes(suite) ||
-                            (suite && suite.includes(t.suiteNumber))
-                          )
+                          const amountVal = parseFloat(amount) || 0
+                          const matchedTenant = matchTenantBySuite(activeTenants, suite)
+                          // Suites the handwriting could equally have been, where the
+                          // amount divides cleanly and for the scanned suite it does not.
+                          const altTenants = suiteAlternatives(activeTenants, suite, amountVal, matchedTenant)
 
                           const confidence = entry.confidence
                           const hasSuite = !!suite
-                          const hasAmount = !!amount && parseFloat(amount) > 0
-
-                          // Multi-week detection
-                          const amountVal = parseFloat(amount) || 0
-                          const weeklyRent = matchedTenant?.weeklyRent || 0
-                          const isMultiWeek = matchedTenant && weeklyRent > 0 && amountVal > weeklyRent
-                          const weeksCount = weeklyRent > 0 ? Math.floor(amountVal / weeklyRent) : 0
-                          const creditAmount = weeklyRent > 0 ? amountVal - (weeksCount * weeklyRent) : 0
+                          const hasAmount = !!amount && amountVal > 0
                           const selectedFridayKeys = edits.fridayKeys || []
+
+                          // Every week this tenant has in the working set, grouped by
+                          // month, so last month's Fridays are selectable too.
+                          const tenantWeeks = matchedTenant && checkBook
+                            ? allWeeksFor(checkBook, matchedTenant.id).map(ref => {
+                                const e = checkBook[ref.monthKey]?.weeks[ref.friday]
+                                  ?.find(x => x.tenant.id === matchedTenant.id)
+                                return { ...ref, owed: e ? owedOn(e) : 0 }
+                              })
+                            : []
+                          const monthGroups = Array.from(new Set(tenantWeeks.map(w => w.monthKey)))
+                            .sort()
+                            .map(mk => ({ monthKey: mk, weeks: tenantWeeks.filter(w => w.monthKey === mk) }))
+
+                          // What the current selection will actually do with the money.
+                          const selectedRefs = selectedFridayKeys.map(f => ({ monthKey: monthKeyOf(f), friday: f }))
+                          const preview = matchedTenant && checkBook && amountVal > 0
+                            ? planAllocation(checkBook, matchedTenant.id, amountVal, selectedRefs)
+                            : { weeks: [], amounts: [], leftover: amountVal, endsPartial: false }
+                          const plannedWeeks = preview.weeks
+                          const leftoverAmount = preview.leftover
 
                           return (
                             <div
@@ -1692,69 +1782,100 @@ export default function RentTracker() {
                                 </div>
                               </div>
 
-                              {/* Multi-week selector or single week dropdown */}
-                              {isMultiWeek ? (
+                              {altTenants.length > 0 && (
+                                <div className="mt-2 rounded border border-amber-300 bg-amber-50 px-2 py-1.5">
+                                  <p className="text-[11px] text-amber-800 leading-snug">
+                                    <strong>Check this suite.</strong>{' '}
+                                    {formatCurrency(amountVal)} doesn&apos;t divide evenly into
+                                    {matchedTenant ? ` ${matchedTenant.name}'s ${formatCurrency(matchedTenant.weeklyRent)}/wk` : ' any tenant at this suite'}.
+                                  </p>
+                                  <div className="flex flex-wrap gap-1.5 mt-1">
+                                    {altTenants.map(alt => (
+                                      <button
+                                        key={alt.id}
+                                        type="button"
+                                        onClick={() => updateCheckEdit(editKey, 'suiteNumber', alt.suiteNumber)}
+                                        className="px-2 py-0.5 rounded text-[11px] font-medium bg-white border border-amber-400 text-amber-800 hover:bg-amber-100"
+                                      >
+                                        Use {alt.suiteNumber} — {alt.name} ({formatCurrency(alt.weeklyRent)}/wk)
+                                      </button>
+                                    ))}
+                                  </div>
+                                </div>
+                              )}
+
+                              {/* Week allocation — spans months, because a deposit
+                                  taken this week is usually paying for last month. */}
+                              {matchedTenant && amountVal > 0 && (
                                 <div className="mt-2 border-t pt-2">
                                   <div className="flex items-center justify-between mb-1.5">
                                     <span className="text-[10px] font-semibold text-purple-700 uppercase">
-                                      {formatCurrency(amountVal)} = {weeksCount} week{weeksCount !== 1 ? 's' : ''} at {formatCurrency(weeklyRent)}/wk
-                                      {creditAmount > 0 && (
-                                        <span className="text-amber-600 ml-1">(+{formatCurrency(creditAmount)} credit)</span>
+                                      {formatCurrency(amountVal)} covers {plannedWeeks.length} week{plannedWeeks.length !== 1 ? 's' : ''}
+                                      {leftoverAmount > 0.005 && (
+                                        <span className="text-amber-600 ml-1">(+{formatCurrency(leftoverAmount)} credit)</span>
                                       )}
-                                      {creditAmount === 0 && <span className="text-green-600 ml-1">(no credit)</span>}
+                                      {leftoverAmount <= 0.005 && plannedWeeks.length > 0 && (
+                                        <span className="text-green-600 ml-1">(exact)</span>
+                                      )}
                                     </span>
                                     <span className={cn(
                                       'text-[10px] px-1.5 py-0.5 rounded font-medium',
-                                      selectedFridayKeys.length === weeksCount ? 'bg-green-100 text-green-700' :
-                                      selectedFridayKeys.length > 0 ? 'bg-amber-100 text-amber-700' :
-                                      'bg-gray-100 text-gray-500'
+                                      selectedFridayKeys.length > 0 ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'
                                     )}>
-                                      Selected: {selectedFridayKeys.length} of {weeksCount} weeks
+                                      {selectedFridayKeys.length > 0
+                                        ? `${selectedFridayKeys.length} week${selectedFridayKeys.length !== 1 ? 's' : ''} selected`
+                                        : 'No week selected'}
                                     </span>
                                   </div>
-                                  <div className="flex flex-wrap gap-1.5">
-                                    {sortedFri.map((f, wi) => {
-                                      const isSelected = selectedFridayKeys.includes(f)
-                                      return (
-                                        <button
-                                          key={f}
-                                          type="button"
-                                          onClick={() => {
-                                            const current = edits.fridayKeys || []
-                                            const updated = isSelected
-                                              ? current.filter(k => k !== f)
-                                              : [...current, f]
-                                            setCheckEdits(prev => ({
-                                              ...prev,
-                                              [editKey]: { ...prev[editKey], fridayKeys: updated },
-                                            }))
-                                          }}
-                                          className={cn(
-                                            'px-2.5 py-1 rounded text-[11px] font-medium border transition-colors',
-                                            isSelected
-                                              ? 'bg-purple-600 text-white border-purple-600'
-                                              : 'bg-white text-gray-600 border-gray-300 hover:border-purple-400'
-                                          )}
-                                        >
-                                          {isSelected && <Check size={10} className="inline mr-1 -mt-0.5" />}
-                                          Wk {wi + 1} ({fridayShortLabel(f)})
-                                        </button>
-                                      )
-                                    })}
-                                  </div>
-                                </div>
-                              ) : (
-                                <div className="mt-2">
-                                  <label className="block text-[10px] font-medium text-gray-500 uppercase mb-0.5">Week</label>
-                                  <select
-                                    value={fridayKey}
-                                    onChange={e => updateCheckEdit(editKey, 'fridayKey', e.target.value)}
-                                    className="w-full border border-gray-300 rounded px-2 py-1 text-sm bg-white"
-                                  >
-                                    {sortedFri.map((f, wi) => (
-                                      <option key={f} value={f}>Week {wi + 1} ({fridayShortLabel(f)})</option>
-                                    ))}
-                                  </select>
+
+                                  {monthGroups.map(group => (
+                                    <div key={group.monthKey} className="mb-1.5">
+                                      <div className="text-[9px] uppercase tracking-wide text-gray-400 mb-0.5">
+                                        {monthLabel(group.monthKey)}
+                                        {group.monthKey !== monthKey && (
+                                          <span className="ml-1 text-purple-500 font-medium">other month</span>
+                                        )}
+                                      </div>
+                                      <div className="flex flex-wrap gap-1.5">
+                                        {group.weeks.map(w => {
+                                          const isSelected = selectedFridayKeys.includes(w.friday)
+                                          return (
+                                            <button
+                                              key={w.friday}
+                                              type="button"
+                                              title={w.owed > 0 ? `${formatCurrency(w.owed)} still owed` : 'Fully paid'}
+                                              onClick={() => {
+                                                const current = selectedFridayKeys
+                                                const updated = isSelected
+                                                  ? current.filter(k => k !== w.friday)
+                                                  : [...current, w.friday].sort()
+                                                setCheckEdits(prev => ({
+                                                  ...prev,
+                                                  [editKey]: { ...prev[editKey], fridayKeys: updated, fridayKey: updated[0] },
+                                                }))
+                                              }}
+                                              className={cn(
+                                                'px-2.5 py-1 rounded text-[11px] font-medium border transition-colors',
+                                                isSelected
+                                                  ? 'bg-purple-600 text-white border-purple-600'
+                                                  : w.owed > 0
+                                                    ? 'bg-white text-gray-600 border-gray-300 hover:border-purple-400'
+                                                    : 'bg-gray-100 text-gray-400 border-gray-200 hover:border-purple-300'
+                                              )}
+                                            >
+                                              {isSelected && <Check size={10} className="inline mr-1 -mt-0.5" />}
+                                              {fridayShortLabel(w.friday)}
+                                              {w.owed <= 0 && <span className="ml-1 opacity-60">paid</span>}
+                                            </button>
+                                          )
+                                        })}
+                                      </div>
+                                    </div>
+                                  ))}
+
+                                  <p className="text-[10px] text-gray-500 mt-1">
+                                    Pre-selected to this tenant&apos;s oldest unpaid weeks. Greyed weeks are already settled.
+                                  </p>
                                 </div>
                               )}
                             </div>
@@ -1765,14 +1886,29 @@ export default function RentTracker() {
                   ))}
                 </div>
 
+                {checkBlockers.length > 0 && (
+                  <div className="rounded border border-red-200 bg-red-50 px-3 py-2">
+                    <p className="text-[11px] font-semibold text-red-800 mb-1">
+                      Waiting on {checkBlockers.length} of {totalEntries} entries:
+                    </p>
+                    <ul className="space-y-0.5">
+                      {checkBlockers.map(b => (
+                        <li key={b.editKey} className="text-[11px] text-red-700">
+                          {b.label} — <span className="italic">{b.reason}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+
                 <div className="flex gap-2 pt-2">
                   <button
                     onClick={handleApplyChecks}
-                    disabled={validEntries.length === 0 || !allCheckMultiWeeksAllocated}
+                    disabled={validEntries.length === 0 || checkBlockers.length > 0}
                     className="flex-1 px-4 py-2 bg-amber-600 text-white text-sm font-medium rounded-lg hover:bg-amber-700 disabled:opacity-50 disabled:cursor-not-allowed"
                   >
-                    {!allCheckMultiWeeksAllocated
-                      ? 'Select weeks for all multi-week entries'
+                    {checkBlockers.length > 0
+                      ? `${checkBlockers.length} entry${checkBlockers.length !== 1 ? '\u2019s' : ''} still needs a week`
                       : `Apply ${validEntries.length} Check${validEntries.length !== 1 ? 's' : ''}`
                     }
                   </button>
@@ -1908,6 +2044,7 @@ function TenantPanel({
     secondName: tenant?.secondName || '',
     suiteNumber: suiteNumber,
     weeklyRent: tenant?.weeklyRent?.toString() || '',
+    monthlyRent: tenant?.monthlyRent?.toString() || '',
     billingFrequency: (tenant?.billingFrequency || 'weekly') as BillingFrequency,
     defaultPayType: (tenant?.defaultPayType || '') as PaymentType | '',
     moveInDate: tenant?.moveInDate || '',
@@ -1925,6 +2062,9 @@ function TenantPanel({
       secondName: showSecondName ? form.secondName : undefined,
       suiteNumber: form.suiteNumber,
       weeklyRent: parseFloat(form.weeklyRent),
+      monthlyRent: form.billingFrequency === 'monthly' && form.monthlyRent
+        ? parseFloat(form.monthlyRent)
+        : undefined,
       billingFrequency: form.billingFrequency,
       defaultPayType: form.defaultPayType as PaymentType || undefined,
       moveInDate: form.moveInDate,
@@ -2040,6 +2180,26 @@ function TenantPanel({
               >
                 {BILLING_FREQUENCIES.map(f => (<option key={f} value={f}>{FREQUENCY_LABELS[f]}</option>))}
               </select>
+
+              {form.billingFrequency === 'monthly' && (
+                <div className="mt-3">
+                  <label className="block text-sm font-medium text-gray-700 mb-1">
+                    Monthly Rent
+                  </label>
+                  <input
+                    type="number"
+                    value={form.monthlyRent}
+                    onChange={e => setForm(f => ({ ...f, monthlyRent: e.target.value }))}
+                    placeholder="e.g. 1900"
+                    className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                  />
+                  <p className="text-xs text-gray-500 mt-1">
+                    The flat amount charged each month. Split evenly across that month&apos;s
+                    Fridays, so a 5-Friday month costs the same as a 4-Friday one. Leave blank
+                    to keep billing weekly rent &times; number of Fridays.
+                  </p>
+                </div>
+              )}
             </div>
           </div>
 

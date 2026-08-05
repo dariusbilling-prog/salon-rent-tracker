@@ -44,6 +44,8 @@ export interface TenantFormData {
   secondName?: string
   suiteNumber: string
   weeklyRent: number
+  /** Flat monthly charge; only meaningful when billingFrequency is 'monthly'. */
+  monthlyRent?: number
   billingFrequency: BillingFrequency
   defaultPayType?: PaymentType
   moveInDate: string
@@ -61,6 +63,7 @@ export function createTenant(tenants: Tenant[], data: TenantFormData): Tenant[] 
     secondName: data.secondName || undefined,
     suiteNumber: data.suiteNumber,
     weeklyRent: data.weeklyRent,
+    monthlyRent: data.billingFrequency === 'monthly' ? data.monthlyRent : undefined,
     billingFrequency: data.billingFrequency,
     defaultPayType: data.defaultPayType,
     moveInDate: data.moveInDate,
@@ -103,6 +106,9 @@ export function updateTenant(tenants: Tenant[], tenantId: string, data: Partial<
       secondName: data.secondName ?? t.secondName,
       suiteNumber: data.suiteNumber ?? t.suiteNumber,
       weeklyRent: data.weeklyRent ?? t.weeklyRent,
+      monthlyRent: (data.billingFrequency ?? t.billingFrequency) === 'monthly'
+        ? (data.monthlyRent ?? t.monthlyRent)
+        : undefined,
       billingFrequency: data.billingFrequency ?? t.billingFrequency,
       defaultPayType: data.defaultPayType ?? t.defaultPayType,
       moveInDate: data.moveInDate ?? t.moveInDate,

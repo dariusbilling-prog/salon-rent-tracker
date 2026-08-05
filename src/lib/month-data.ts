@@ -2,7 +2,7 @@
 // Handles: week generation, smart merge from CSV, localStorage persistence
 
 import { Tenant, TenantWeekEntry, PaymentType } from '@/types'
-import { generateWeekEntries } from './tenant-data'
+import { generateWeekEntries, weekDueForTenant } from './tenant-data'
 import { getFridaysInMonth } from './utils'
 import { CSVMatch } from './csv-parser'
 import { pushKey } from './cloud-sync'
@@ -30,13 +30,14 @@ export function createEmptyMonth(monthKey: string, tenants: Tenant[]): MonthData
   const today = new Date()
   today.setHours(0, 0, 0, 0)
 
-  for (const friday of fridays) {
+  for (let wi = 0; wi < fridays.length; wi++) {
+    const friday = fridays[wi]
     const [fy, fm, fd] = friday.split('-').map(Number)
     const fridayDate = new Date(fy, fm - 1, fd)
     fridayDate.setHours(0, 0, 0, 0)
     const isPastDue = today > fridayDate
 
-    weeks[friday] = generateWeekEntries(tenants).map(e => ({
+    weeks[friday] = generateWeekEntries(tenants, wi, fridays.length).map(e => ({
       ...e,
       paymentSource: 'none' as PaymentSource,
       // Auto-mark as late if the Friday has already passed
@@ -45,6 +46,44 @@ export function createEmptyMonth(monthKey: string, tenants: Tenant[]): MonthData
   }
 
   return { monthKey, weeks }
+}
+
+/**
+ * Recompute `amountDue` for every entry from the current tenant records, without
+ * touching anything that was actually paid.
+ *
+ * Needed because `amountDue` is frozen into each week when the month is first
+ * created. If a tenant's rent changes — most importantly when a monthly tenant
+ * gets a real `monthlyRent` instead of an inferred weekly figure — already-built
+ * months keep billing the old number forever. Statuses are re-derived so a week
+ * that is now fully covered stops showing as partial (and vice versa).
+ */
+export function recalcMonthDues(data: MonthData, tenants: Tenant[]): MonthData {
+  const fridays = Object.keys(data.weeks).sort()
+  const weeks: Record<string, MonthTenantEntry[]> = {}
+
+  for (let wi = 0; wi < fridays.length; wi++) {
+    const friday = fridays[wi]
+    weeks[friday] = data.weeks[friday].map(entry => {
+      const tenant = tenants.find(t => t.id === entry.tenant.id) || entry.tenant
+      if (entry.isVacant) return { ...entry, tenant }
+
+      const amountDue = weekDueForTenant(tenant, wi, fridays.length)
+      if (amountDue === entry.amountDue && tenant === entry.tenant) return entry
+
+      // Only re-derive the statuses that are purely a function of money.
+      // Manual states (free_week, comped_week, biweekly_off, monthly_pending)
+      // are deliberate choices and must survive a rent change.
+      let status = entry.status
+      if (status === 'paid' || status === 'partial') {
+        status = entry.amountPaid >= amountDue ? 'paid' : 'partial'
+      }
+
+      return { ...entry, tenant, amountDue, status }
+    })
+  }
+
+  return { ...data, weeks }
 }
 
 // Smart merge: update ACH/Card (csv-sourced) entries from new CSV,
@@ -58,9 +97,10 @@ export function mergeCSVIntoMonth(
   const weeks = { ...monthData.weeks }
 
   // Ensure every Friday in month has an entry list
-  for (const friday of fridays) {
+  for (let wi = 0; wi < fridays.length; wi++) {
+    const friday = fridays[wi]
     if (!weeks[friday]) {
-      weeks[friday] = generateWeekEntries(tenants).map(e => ({
+      weeks[friday] = generateWeekEntries(tenants, wi, fridays.length).map(e => ({
         ...e,
         paymentSource: 'none',
       }))

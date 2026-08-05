@@ -134,3 +134,44 @@ export function getCurrentRentWeek(): { weekStart: string; weekEnd: string; dueD
     weekLabel,
   }
 }
+
+// ---------------------------------------------------------------------------
+// Monthly rent distribution
+// ---------------------------------------------------------------------------
+
+/**
+ * Split a flat monthly rent across the Fridays of that month, exact to the cent.
+ *
+ * A month has either 4 or 5 Fridays, but a monthly tenant owes the same flat
+ * amount either way. Multiplying a weekly figure by the Friday count overcharges
+ * them every 5-Friday month, so instead we divide the real monthly amount and
+ * hand the leftover cents to the earliest weeks. The shares always sum back to
+ * exactly `monthlyRent`.
+ */
+export function monthlyWeekShare(monthlyRent: number, weekCount: number, index: number): number {
+  if (weekCount <= 0 || monthlyRent <= 0) return 0
+  const cents = Math.round(monthlyRent * 100)
+  const base = Math.floor(cents / weekCount)
+  const remainder = cents - base * weekCount
+  return (base + (index < remainder ? 1 : 0)) / 100
+}
+
+/**
+ * True when two suite labels differ by exactly one character in the same position
+ * (e.g. "126" vs "128"). Used to catch OCR digit confusion — 6/8, 1/7, 3/5, 0/6.
+ */
+export function isNearSuite(a: string, b: string): boolean {
+  const x = a.trim()
+  const y = b.trim()
+  if (x.length !== y.length || x === y) return false
+  let diffs = 0
+  for (let i = 0; i < x.length; i++) {
+    if (x[i] !== y[i] && ++diffs > 1) return false
+  }
+  return diffs === 1
+}
+
+/** Money comparison that tolerates floating point dust. */
+export function moneyEquals(a: number, b: number): boolean {
+  return Math.abs(a - b) < 0.005
+}
