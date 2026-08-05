@@ -1,6 +1,6 @@
 import * as fs from 'fs'
 import { parseAndMatchCSV } from '@/lib/csv-parser'
-import { createEmptyMonth, mergeCSVIntoMonth } from '@/lib/month-data'
+import { createEmptyMonth, mergeCSVIntoMonth, MonthData } from '@/lib/month-data'
 import { TENANTS } from '@/lib/tenant-data'
 import { Tenant } from '@/types'
 const roster: Tenant[] = TENANTS.map(t => {
@@ -8,7 +8,11 @@ const roster: Tenant[] = TENANTS.map(t => {
   if (t.suiteNumber === '134') return { ...t, weeklyRent:250, billingFrequency:'monthly' as const, monthlyRent:1083 }
   return t })
 const r = parseAndMatchCSV(fs.readFileSync(process.argv[2] || './tx.csv','utf8'), roster)
-const sum=(m:any)=>Math.round(Object.values(m.weeks).flat().reduce((a:any,e:any)=>a+e.amountPaid,0)*100)/100
+const sum = (m: MonthData): number => {
+  let total = 0
+  for (const entries of Object.values(m.weeks)) for (const e of entries) total += e.amountPaid || 0
+  return Math.round(total * 100) / 100
+}
 const jul = mergeCSVIntoMonth(createEmptyMonth('2026-07', roster), r.matched, roster)
 const aug = mergeCSVIntoMonth(createEmptyMonth('2026-08', roster), r.matched, roster)
 const sep = mergeCSVIntoMonth(createEmptyMonth('2026-06', roster), r.matched, roster)
