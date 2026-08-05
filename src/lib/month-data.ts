@@ -115,15 +115,57 @@ export function mergeCSVIntoMonth(
   }
 
   for (const match of matches) {
-    if (match.isMonthlyPayment) {
-      // Apply monthly payment to every Friday in the month
-      for (const friday of fridays) {
-        matchesByFriday[friday].push(match)
-      }
-    } else {
-      // Weekly payment goes to its specific Friday
-      if (matchesByFriday[match.dueDate]) {
-        matchesByFriday[match.dueDate].push(match)
+    // Monthly payments are handled separately below. They used to be pushed onto
+    // every Friday in the month, and each Friday then wrote the FULL amount —
+    // so one $1,083 monthly payment was recorded five times, as $5,415. It went
+    // unnoticed for months because the tenant was configured as weekly, which
+    // made it look like a single odd payment rather than a duplicated one.
+    if (match.isMonthlyPayment) continue
+
+    // Weekly payment goes to its specific Friday
+    if (matchesByFriday[match.dueDate]) {
+      matchesByFriday[match.dueDate].push(match)
+    }
+  }
+
+  // ---- Monthly payments: spread the ONE payment across the month's weeks ----
+  // Fill each week up to what it owes, oldest first, and stop when the money runs
+  // out. The weeks always sum back to the amount actually received.
+  for (const match of matches) {
+    if (!match.isMonthlyPayment) continue
+
+    let remaining = Math.round(match.amount * 100) / 100
+    const pendingShare = match.amount > 0 ? (match.pendingAmount || 0) / match.amount : 0
+
+    for (const friday of fridays) {
+      if (remaining <= 0.005) break
+      const entries = weeks[friday]
+      if (!entries) continue
+      const idx = entries.findIndex(e => e.tenant.id === match.tenant.id)
+      if (idx === -1) continue
+
+      const existing = entries[idx]
+      // Hand-entered payments still win over a re-import.
+      if ((existing.paymentSource || 'none') === 'manual' && existing.amountPaid > 0) continue
+
+      const share = Math.round(Math.min(remaining, existing.amountDue) * 100) / 100
+      if (share <= 0) continue
+      remaining = Math.round((remaining - share) * 100) / 100
+
+      const weekPending = Math.round(share * pendingShare * 100) / 100
+      entries[idx] = {
+        ...existing,
+        amountPaid: share,
+        paymentType: match.paymentType,
+        status: share >= existing.amountDue - 0.005 ? 'paid' : 'partial',
+        confirmation: weekPending > 0
+          ? 'ACH Pending'
+          : match.paymentType === 'ACH' || match.paymentType === 'Card'
+            ? 'Card Processed'
+            : undefined,
+        pendingAmount: weekPending > 0 ? weekPending : undefined,
+        paidDate: match.paidDate,
+        paymentSource: 'csv',
       }
     }
   }
