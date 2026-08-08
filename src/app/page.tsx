@@ -15,7 +15,7 @@ import {
   getCurrentMonthKey, monthLabel, addMonths, fridayShortLabel, fridayFullLabel,
   getFridaysInMonth, isNearSuite
 } from '@/lib/utils'
-import { generateWeeklyPDF } from '@/lib/pdf-generator'
+import { generateMonthlyPDF } from '@/lib/pdf-generator'
 import { parseAndMatchCSV, CSVMatchResult } from '@/lib/csv-parser'
 import { buildReminderMessage, buildDetailedReminder, formatPhoneForSMS, LateWeekInfo } from '@/lib/sms'
 import {
@@ -38,6 +38,9 @@ import {
   useCredit, getTenantCredit, TenantFormData
 } from '@/lib/tenant-manager'
 import { initCloudSync } from '@/lib/cloud-sync'
+import {
+  MaintenanceEntry, loadMaintenance, saveMaintenance, maintenanceTotal, newMaintenanceId,
+} from '@/lib/maintenance'
 
 const WEEK_STATUSES: WeekStatus[] = ['paid', 'partial', 'late', 'unpaid', 'free_week', 'comped_week']
 const PAYMENT_TYPES: PaymentType[] = ['ACH', 'Zelle', 'Check', 'Cash', 'Money Order', 'Card']
@@ -85,6 +88,9 @@ export default function RentTracker() {
   // Short confirmation after a roster change, so it is visible that earlier
   // months were updated too rather than silently rewritten.
   const [rosterNotice, setRosterNotice] = useState<string | null>(null)
+  // Maintenance costs for the month — the fourth section of the P&L.
+  const [maintenance, setMaintenance] = useState<MaintenanceEntry[]>([])
+  const [showMaintenance, setShowMaintenance] = useState(false)
 
   // Tenant management state
   const [showTenantPanel, setShowTenantPanel] = useState(false)
@@ -103,6 +109,14 @@ export default function RentTracker() {
 
   const activeTenants = useMemo(() => getActiveTenants(tenants), [tenants])
   const archivedTenants = useMemo(() => getArchivedTenants(tenants), [tenants])
+
+  // Maintenance is stored per month, so it reloads with the month.
+  useEffect(() => { setMaintenance(loadMaintenance(monthKey)) }, [monthKey])
+
+  const updateMaintenance = useCallback((next: MaintenanceEntry[]) => {
+    setMaintenance(next)
+    saveMaintenance(monthKey, next)
+  }, [monthKey])
 
   // Load month data from localStorage when month changes
   useEffect(() => {
@@ -599,19 +613,27 @@ export default function RentTracker() {
   }, [activeTenants])
 
   // PDF export
+  /**
+   * One button, one report: the monthly P&L for whichever month is on screen.
+   *
+   * It used to depend on which tab you were looking at — a single week from a
+   * week tab, the month only from Monthly Summary — which meant clicking PDF
+   * usually produced the wrong document. The monthly report already contains a
+   * detail page per week, so nothing is lost by always exporting the month.
+   */
   const handleExportPDF = useCallback(() => {
-    if (activeTab === 'monthly-summary' || !activeTab) return
-    const weekLabel = fridayFullLabel(activeTab)
-    const doc = generateWeeklyPDF({
-      weekLabel,
-      entries: currentWeekEntries,
-      totalDue: stats.totalDue,
-      totalPaid: stats.totalPaid,
-      totalPending: stats.totalPending,
-      dueDate: activeTab,
+    const label = monthLabel(monthKey) // e.g. "July 2026"
+    const [monthName, year] = label.split(' ')
+    const doc = generateMonthlyPDF({
+      monthName, year,
+      weeks: Object.keys(monthData.weeks).sort().map(friday => ({
+        friday,
+        entries: monthData.weeks[friday],
+      })),
+      maintenance,
     })
-    doc.save(`Salon_Boutique_${activeTab}.pdf`)
-  }, [activeTab, currentWeekEntries, stats])
+    doc.save(`Salon Boutique Rockwall - ${monthName} P&L - ${year}.pdf`)
+  }, [monthKey, monthData, maintenance])
 
   // Manual entry
   const [manualForm, setManualForm] = useState({
@@ -1135,7 +1157,20 @@ export default function RentTracker() {
                   <MessageSquare size={14} /> Late Reminders
                 </button>
                 <button
+                  onClick={() => setShowMaintenance(true)}
+                  title="Record repairs and invoices for this month"
+                  className="px-3 py-1.5 bg-slate-600 text-white text-sm font-medium rounded-lg hover:bg-slate-700 flex items-center gap-1.5"
+                >
+                  <Wallet size={14} /> Maintenance
+                  {maintenance.length > 0 && (
+                    <span className="ml-0.5 px-1.5 py-0.5 rounded bg-slate-500 text-[10px]">
+                      {maintenance.length}
+                    </span>
+                  )}
+                </button>
+                <button
                   onClick={handleExportPDF}
+                  title={`Generate the ${monthLabel(monthKey)} P&L report`}
                   className="px-3 py-1.5 bg-emerald-600 text-white text-sm font-medium rounded-lg hover:bg-emerald-700 flex items-center gap-1.5"
                 >
                   <FileDown size={14} /> PDF
@@ -1184,6 +1219,17 @@ export default function RentTracker() {
           </div>
         </div>
       </header>
+
+      {/* Maintenance log — the P&L's fourth section, entered by hand because
+          repair invoices arrive by email and post, not through TenantCloud. */}
+      {showMaintenance && (
+        <MaintenanceModal
+          monthLabel={monthLabel(monthKey)}
+          entries={maintenance}
+          onChange={updateMaintenance}
+          onClose={() => setShowMaintenance(false)}
+        />
+      )}
 
       {rosterNotice && (
         <div className="fixed bottom-4 right-4 z-50 max-w-sm rounded-lg border border-green-300 bg-green-50 shadow-lg px-4 py-3">
@@ -2820,25 +2866,15 @@ function EntryRow({
 
 function NotesCell({ notes, onChange, isVacant }: { notes: string; onChange: (val: string) => void; isVacant: boolean }) {
   const [isOpen, setIsOpen] = useState(false)
-  if (isVacant) return null
+  // Vacant rows need notes too — the report asks WHY a suite sat empty.
 
-  if (notes) {
-    return (
-      <div className="flex items-center gap-1">
-        <input
-          type="text"
-          value={notes}
-          onChange={e => onChange(e.target.value)}
-          className="flex-1 text-xs border-0 border-b border-gray-200 bg-transparent px-1 py-0.5 focus:outline-none focus:border-blue-300 text-gray-600"
-        />
-        <button onClick={() => { onChange(''); setIsOpen(false) }} className="text-gray-300 hover:text-red-400 flex-shrink-0" title="Clear notes">
-          <X size={12} />
-        </button>
-      </div>
-    )
-  }
+  // ONE input element for both the empty and filled states. Rendering a
+  // different input once `notes` became non-empty unmounted the focused field
+  // after the first keystroke, so a new note could only ever be one character
+  // long — type "Behind" and you were left with "B".
+  const showInput = isOpen || !!notes
 
-  if (!isOpen) {
+  if (!showInput) {
     return (
       <button onClick={() => setIsOpen(true)} className="text-gray-300 hover:text-gray-500 p-0.5" title="Add note">
         <StickyNote size={14} />
@@ -2847,15 +2883,26 @@ function NotesCell({ notes, onChange, isVacant }: { notes: string; onChange: (va
   }
 
   return (
-    <input
-      type="text"
-      value={notes}
-      onChange={e => onChange(e.target.value)}
-      placeholder="Add note..."
-      autoFocus
-      onBlur={() => { if (!notes) setIsOpen(false) }}
-      className="w-full text-xs border-0 border-b border-blue-300 bg-transparent px-1 py-0.5 focus:outline-none text-gray-600"
-    />
+    <div className="flex items-center gap-1">
+      <input
+        type="text"
+        value={notes}
+        onChange={e => onChange(e.target.value)}
+        placeholder="Add note..."
+        autoFocus={isOpen && !notes}
+        onBlur={() => { if (!notes) setIsOpen(false) }}
+        className="flex-1 text-xs border-0 border-b border-gray-200 bg-transparent px-1 py-0.5 focus:outline-none focus:border-blue-300 text-gray-600"
+      />
+      {!!notes && (
+        <button
+          onClick={() => { onChange(''); setIsOpen(false) }}
+          className="text-gray-300 hover:text-red-400 flex-shrink-0"
+          title="Clear notes"
+        >
+          <X size={12} />
+        </button>
+      )}
+    </div>
   )
 }
 
@@ -2921,6 +2968,138 @@ function Modal({ onClose, title, children, wide }: { onClose: () => void; title:
       <div className={cn('bg-white rounded-xl shadow-xl p-5 mx-4', wide ? 'w-full max-w-2xl' : 'w-full max-w-md')} onClick={e => e.stopPropagation()}>
         <h3 className="text-lg font-semibold text-gray-900 mb-3">{title}</h3>
         {children}
+      </div>
+    </div>
+  )
+}
+
+
+function MaintenanceModal({
+  monthLabel: label,
+  entries,
+  onChange,
+  onClose,
+}: {
+  monthLabel: string
+  entries: MaintenanceEntry[]
+  onChange: (next: MaintenanceEntry[]) => void
+  onClose: () => void
+}) {
+  const blank = { date: '', company: '', location: 'Building', activity: '', cost: '', notes: '' }
+  const [form, setForm] = useState(blank)
+
+  const canAdd = form.date && form.company && form.cost && parseFloat(form.cost) > 0
+
+  const add = () => {
+    if (!canAdd) return
+    onChange([...entries, {
+      id: newMaintenanceId(),
+      date: form.date,
+      company: form.company,
+      location: form.location || 'Building',
+      activity: form.activity,
+      cost: parseFloat(form.cost),
+      notes: form.notes,
+    }])
+    setForm(blank)
+  }
+
+  const total = maintenanceTotal(entries)
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+      <div className="absolute inset-0 bg-black/40" onClick={onClose} />
+      <div className="relative bg-white rounded-xl shadow-2xl w-full max-w-4xl max-h-[85vh] flex flex-col">
+        <div className="flex items-center justify-between px-5 py-4 border-b border-gray-200">
+          <div>
+            <h3 className="text-lg font-semibold text-gray-900">Maintenance Log</h3>
+            <p className="text-xs text-gray-500">{label} — appears on the monthly P&amp;L</p>
+          </div>
+          <button onClick={onClose} className="p-1.5 text-gray-400 hover:text-gray-600 rounded-lg hover:bg-gray-100">
+            <X size={20} />
+          </button>
+        </div>
+
+        <div className="flex-1 overflow-y-auto px-5 py-4">
+          {entries.length === 0 ? (
+            <p className="text-sm text-gray-500 mb-4">
+              No repairs recorded for {label} yet. Add each invoice below.
+            </p>
+          ) : (
+            <table className="w-full text-sm mb-4">
+              <thead>
+                <tr className="text-left text-[11px] uppercase text-gray-500 border-b">
+                  <th className="py-1.5">Date</th><th>Company</th><th>Suite / Bldg</th>
+                  <th>Activity</th><th className="text-right">Cost</th><th>Notes</th><th />
+                </tr>
+              </thead>
+              <tbody>
+                {[...entries].sort((a, b) => a.date.localeCompare(b.date)).map(m => (
+                  <tr key={m.id} className="border-b border-gray-100">
+                    <td className="py-1.5 whitespace-nowrap">{m.date}</td>
+                    <td>{m.company}</td>
+                    <td>{m.location}</td>
+                    <td>{m.activity}</td>
+                    <td className="text-right font-mono text-red-700">{formatCurrency(m.cost)}</td>
+                    <td className="text-gray-500">{m.notes}</td>
+                    <td className="text-right">
+                      <button
+                        onClick={() => onChange(entries.filter(x => x.id !== m.id))}
+                        className="text-gray-400 hover:text-red-600"
+                        title="Remove"
+                      >
+                        <X size={14} />
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+                <tr>
+                  <td colSpan={4} className="py-2 text-right font-semibold">Total in Monthly Maintenance</td>
+                  <td className="text-right font-bold font-mono text-red-700">{formatCurrency(total)}</td>
+                  <td colSpan={2} />
+                </tr>
+              </tbody>
+            </table>
+          )}
+
+          <div className="border-t pt-4">
+            <p className="text-xs font-semibold text-gray-600 uppercase mb-2">Add an invoice</p>
+            <div className="grid grid-cols-6 gap-2">
+              <input type="date" value={form.date}
+                onChange={e => setForm(f => ({ ...f, date: e.target.value }))}
+                className="border border-gray-300 rounded px-2 py-1.5 text-sm" />
+              <input placeholder="Company" value={form.company}
+                onChange={e => setForm(f => ({ ...f, company: e.target.value }))}
+                className="border border-gray-300 rounded px-2 py-1.5 text-sm" />
+              <input placeholder="Building or suite" value={form.location}
+                onChange={e => setForm(f => ({ ...f, location: e.target.value }))}
+                className="border border-gray-300 rounded px-2 py-1.5 text-sm" />
+              <input placeholder="Activity" value={form.activity}
+                onChange={e => setForm(f => ({ ...f, activity: e.target.value }))}
+                className="border border-gray-300 rounded px-2 py-1.5 text-sm" />
+              <input placeholder="Cost" type="number" step="0.01" value={form.cost}
+                onChange={e => setForm(f => ({ ...f, cost: e.target.value }))}
+                className="border border-gray-300 rounded px-2 py-1.5 text-sm text-right" />
+              <input placeholder="Invoice #" value={form.notes}
+                onChange={e => setForm(f => ({ ...f, notes: e.target.value }))}
+                onKeyDown={e => { if (e.key === 'Enter') add() }}
+                className="border border-gray-300 rounded px-2 py-1.5 text-sm" />
+            </div>
+            <button
+              onClick={add}
+              disabled={!canAdd}
+              className="mt-3 px-4 py-2 bg-slate-700 text-white text-sm font-medium rounded-lg hover:bg-slate-800 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5"
+            >
+              <Plus size={14} /> Add invoice
+            </button>
+          </div>
+        </div>
+
+        <div className="px-5 py-3 border-t border-gray-200 flex justify-end">
+          <button onClick={onClose} className="px-4 py-2 bg-gray-900 text-white text-sm font-medium rounded-lg hover:bg-gray-800">
+            Done
+          </button>
+        </div>
       </div>
     </div>
   )
