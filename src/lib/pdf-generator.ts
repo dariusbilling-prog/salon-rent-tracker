@@ -377,6 +377,13 @@ export function generateMonthlyPDF(data: MonthlyReportData): jsPDF {
 
   // ---- 2. Detailed Late Payment -------------------------------------------
   const lateRows = Array.from(lates.values()).sort((a, b) => (b.due - b.paid) - (a.due - a.paid))
+  // Sum the rows actually printed above, NOT the month-wide outstanding.
+  // Those two figures diverge whenever anyone overpays: an overpayment reduces
+  // `outstanding` but never appears in this table, so the footer read $780 under
+  // rows that added to $880. An accountant checks a column total by adding the
+  // column, and a footer that does not match is the fastest way to lose their
+  // trust in the whole report.
+  const lateTotal = r2(lateRows.reduce((sum, l) => sum + (l.due - l.paid), 0))
   let y = ensureRoom(((doc as any).lastAutoTable?.finalY || 180) + 26, lateRows.length || 1)
   section('Detailed Late Payment Section', y)
   autoTable(doc, {
@@ -389,7 +396,7 @@ export function generateMonthlyPDF(data: MonthlyReportData): jsPDF {
           acc(-(r2(l.due - l.paid))), l.notes.join('; '),
         ])
       : [['—', '', '', '', acc(0), 'Everything billed was collected in full']],
-    foot: [['', '', '', 'Total Due:', { content: acc(-outstanding), styles: { halign: 'right' as const } }, '']],
+    foot: [['', '', '', 'Total Due:', { content: acc(-lateTotal), styles: { halign: 'right' as const } }, '']],
     footStyles: { fillColor: [242, 242, 242], textColor: [192, 0, 0], fontStyle: 'bold', fontSize: 8.5 },
     columnStyles: {
       0: { cellWidth: 170 }, 1: { cellWidth: 70, halign: 'center' },
@@ -400,6 +407,22 @@ export function generateMonthlyPDF(data: MonthlyReportData): jsPDF {
       if (d.section === 'body' && d.column.index === 4) d.cell.styles.textColor = [192, 0, 0]
     },
   })
+
+  // Where tenants have paid more than they were billed, the outstanding balance
+  // in the overview is smaller than the total owed above. Say so in one line,
+  // rather than leaving two different totals on the page unexplained.
+  const overpaid = r2(lateTotal - outstanding)
+  if (Math.abs(overpaid) > 0.005) {
+    const noteY = ((doc as any).lastAutoTable?.finalY || y) + 14
+    doc.setFontSize(7.5); doc.setFont('helvetica', 'italic'); doc.setTextColor(120, 120, 120)
+    doc.text(
+      `Total owed above is ${acc(lateTotal)}. Overpayments elsewhere in the month of ${acc(overpaid)} reduce the ` +
+        `Outstanding Balance in the Monthly Overview to ${acc(outstanding)}.`,
+      M, noteY
+    )
+    doc.setFont('helvetica', 'normal'); doc.setTextColor(0, 0, 0)
+    ;(doc as any).lastAutoTable.finalY = noteY + 4
+  }
 
   // ---- 3. Vacancy ----------------------------------------------------------
   const vacRows = Array.from(vacancies.values())
