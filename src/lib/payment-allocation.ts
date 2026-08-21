@@ -182,12 +182,18 @@ export function applyPaymentAcross(
   targets: WeekRef[],
   tenantId: string,
   amount: number,
-  meta: PaymentMeta
+  meta: PaymentMeta,
+  options?: { evenSplit?: boolean }
 ): AllocationResult {
   const next: MonthBook = { ...book }
   const touched = new Set<string>()
   const lines: Array<WeekRef & { applied: number }> = []
   let remaining = round2(amount)
+
+  // For monthly tenants: divide payment evenly across selected weeks
+  const perWeekShare = options?.evenSplit && targets.length > 0
+    ? round2(amount / targets.length)
+    : 0
 
   for (const ref of targets) {
     if (remaining <= 0.005) break
@@ -204,15 +210,22 @@ export function applyPaymentAcross(
     // settled — but it will only take what it is short, so it can never be wiped.
     if (owed <= 0) continue
 
-    const applied = round2(Math.min(remaining, owed))
+    const applied = options?.evenSplit
+      ? round2(Math.min(remaining, perWeekShare))
+      : round2(Math.min(remaining, owed))
     if (applied <= 0) continue
     remaining = round2(remaining - applied)
 
     const amountPaid = round2(existing.amountPaid + applied)
+    // Monthly even-split: the flat payment covers the obligation even when
+    // the per-week share is less than the listed weekly amountDue.
+    const fullyPaid = options?.evenSplit
+      ? true
+      : amountPaid >= existing.amountDue - 0.005
     entries[idx] = {
       ...existing,
       amountPaid,
-      status: amountPaid >= existing.amountDue - 0.005 ? 'paid' : 'partial',
+      status: fullyPaid ? 'paid' : 'partial',
       paymentType: meta.paymentType,
       confirmation: meta.confirmation ?? existing.confirmation,
       // Keep every check number that funded this week, so two checks on one week

@@ -400,11 +400,12 @@ export default function RentTracker() {
           .map(f => ({ monthKey: monthKeyOf(f), friday: f }))
           .filter(ref => !!book[ref.monthKey]?.weeks[ref.friday])
 
+        const isMonthly = tenant.billingFrequency === 'monthly'
         const res = applyPaymentAcross(book, targets, tenant.id, totalAmount, {
           paymentType: 'Check',
           checkNumber: checkNum || undefined,
           confirmation: 'Check',
-        })
+        }, isMonthly ? { evenSplit: true } : undefined)
 
         book = res.book
         if (res.leftover > 0.005) {
@@ -648,9 +649,14 @@ export default function RentTracker() {
   // Multi-week detection for manual entry
   const manualTenant = activeTenants.find(t => t.id === manualForm.tenantId)
   const manualAmount = parseFloat(manualForm.amount) || 0
+  const manualIsMonthly = manualTenant?.billingFrequency === 'monthly'
   const manualIsMultiWeek = manualTenant && manualTenant.weeklyRent > 0 && manualAmount > manualTenant.weeklyRent
-  const manualWeeksCount = manualTenant && manualTenant.weeklyRent > 0 ? Math.floor(manualAmount / manualTenant.weeklyRent) : 0
-  const manualCreditAmount = manualTenant && manualTenant.weeklyRent > 0 ? manualAmount - (manualWeeksCount * manualTenant.weeklyRent) : 0
+  const manualWeeksCount = manualIsMonthly
+    ? 0  // monthly tenants pick weeks freely, no fixed count
+    : (manualTenant && manualTenant.weeklyRent > 0 ? Math.floor(manualAmount / manualTenant.weeklyRent) : 0)
+  const manualCreditAmount = manualIsMonthly
+    ? 0  // no credit math for monthly — entire payment is the obligation
+    : (manualTenant && manualTenant.weeklyRent > 0 ? manualAmount - (manualWeeksCount * manualTenant.weeklyRent) : 0)
 
   const handleManualAdd = useCallback(() => {
     if (!manualForm.tenantId || !manualForm.amount) return
@@ -674,8 +680,9 @@ export default function RentTracker() {
       return
     }
 
-    // Multi-week: apply across selected weeks
-    if (manualForm.multiWeekKeys.length > 1 && weeklyRent > 0) {
+    // Multi-week or monthly: apply across selected weeks
+    const isMonthly = tenant?.billingFrequency === 'monthly'
+    if ((manualForm.multiWeekKeys.length > 1 && weeklyRent > 0) || (isMonthly && manualForm.multiWeekKeys.length > 0)) {
       // Same engine as the deposit-slip path. The old code here assigned
       // `amountPaid = applyAmount` (wiping anything already on the week) and then
       // computed the leftover as `selectedWeeks * weeklyRent`, which is wrong the
@@ -692,7 +699,7 @@ export default function RentTracker() {
         checkNumber: manualForm.checkNumber || undefined,
         notes: manualForm.notes || undefined,
         confirmation,
-      })
+      }, isMonthly ? { evenSplit: true } : undefined)
 
       setMonthData(res.book[monthData.monthKey])
 
@@ -1070,7 +1077,10 @@ export default function RentTracker() {
   }, [checkResults, checkEdits, activeTenants])
 
   // Manual entry: check if multi-week is fully allocated
-  const manualMultiWeekAllocated = !manualIsMultiWeek || manualForm.multiWeekKeys.length === manualWeeksCount
+  // Monthly tenants: just need at least one week selected (no fixed count)
+  const manualMultiWeekAllocated = manualIsMonthly
+    ? manualForm.multiWeekKeys.length > 0
+    : !manualIsMultiWeek || manualForm.multiWeekKeys.length === manualWeeksCount
 
   return (
     <div className="min-h-screen bg-gray-50">
@@ -1432,25 +1442,33 @@ export default function RentTracker() {
               </div>
             )}
             {/* Multi-week selector for manual entry */}
-            {manualIsMultiWeek && (() => {
+            {(manualIsMultiWeek || manualIsMonthly) && (() => {
               const sortedFri = Object.keys(monthData.weeks).sort()
               return (
                 <div className="border border-purple-200 bg-purple-50 rounded-lg px-3 py-2">
                   <div className="flex items-center justify-between mb-2">
                     <span className="text-xs font-semibold text-purple-700">
-                      {formatCurrency(manualAmount)} = {manualWeeksCount} week{manualWeeksCount !== 1 ? 's' : ''} at {formatCurrency(manualTenant!.weeklyRent)}/wk
-                      {manualCreditAmount > 0 && (
-                        <span className="text-amber-600 ml-1">(+{formatCurrency(manualCreditAmount)} credit)</span>
+                      {manualIsMonthly ? (
+                        <>{formatCurrency(manualAmount)} — monthly payment, select weeks to cover</>
+                      ) : (
+                        <>{formatCurrency(manualAmount)} = {manualWeeksCount} week{manualWeeksCount !== 1 ? 's' : ''} at {formatCurrency(manualTenant!.weeklyRent)}/wk
+                        {manualCreditAmount > 0 && (
+                          <span className="text-amber-600 ml-1">(+{formatCurrency(manualCreditAmount)} credit)</span>
+                        )}
+                        {manualCreditAmount === 0 && <span className="text-green-600 ml-1">(no credit)</span>}</>
                       )}
-                      {manualCreditAmount === 0 && <span className="text-green-600 ml-1">(no credit)</span>}
                     </span>
                     <span className={cn(
                       'text-[10px] px-1.5 py-0.5 rounded font-medium',
-                      manualForm.multiWeekKeys.length === manualWeeksCount ? 'bg-green-100 text-green-700' :
-                      manualForm.multiWeekKeys.length > 0 ? 'bg-amber-100 text-amber-700' :
-                      'bg-gray-100 text-gray-500'
+                      manualIsMonthly
+                        ? (manualForm.multiWeekKeys.length > 0 ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-500')
+                        : (manualForm.multiWeekKeys.length === manualWeeksCount ? 'bg-green-100 text-green-700' :
+                           manualForm.multiWeekKeys.length > 0 ? 'bg-amber-100 text-amber-700' :
+                           'bg-gray-100 text-gray-500')
                     )}>
-                      Selected: {manualForm.multiWeekKeys.length} of {manualWeeksCount} weeks
+                      {manualIsMonthly
+                        ? `${manualForm.multiWeekKeys.length} week${manualForm.multiWeekKeys.length !== 1 ? 's' : ''} selected`
+                        : `Selected: ${manualForm.multiWeekKeys.length} of ${manualWeeksCount} weeks`}
                     </span>
                   </div>
                   <p className="text-[10px] text-purple-600 mb-2">Select which weeks to apply this payment to:</p>
