@@ -86,6 +86,34 @@ export function recalcMonthDues(data: MonthData, tenants: Tenant[]): MonthData {
   return { ...data, weeks }
 }
 
+/**
+ * Snap a date string to the nearest Friday from the available list.
+ *
+ * TenantCloud lets landlords set any day-of-week as the due date, but our week
+ * keys are always Fridays. A Monday due date like "2026-08-03" belongs to the
+ * rent week ending Friday "2026-08-07". Without this, payments for tenants whose
+ * TenantCloud due day isn't Friday are silently dropped.
+ *
+ * Logic: Sun–Fri → next Friday (inclusive); Sat → previous Friday.
+ * Returns null if the snapped date isn't in the provided list (wrong month).
+ */
+function snapToFriday(dateStr: string, fridays: string[]): string | null {
+  // Fast path: already a Friday in this month
+  if (fridays.includes(dateStr)) return dateStr
+
+  const d = new Date(dateStr + 'T12:00:00') // noon avoids timezone edge cases
+  const day = d.getDay() // 0=Sun … 5=Fri 6=Sat
+  if (day === 6) {
+    // Saturday → belongs to the week that just ended (previous Friday)
+    d.setDate(d.getDate() - 1)
+  } else if (day !== 5) {
+    // Sun–Thu → forward to the Friday that closes this rent week
+    d.setDate(d.getDate() + ((5 - day + 7) % 7))
+  }
+  const snapped = d.toISOString().slice(0, 10)
+  return fridays.includes(snapped) ? snapped : null
+}
+
 // Smart merge: update ACH/Card (csv-sourced) entries from new CSV,
 // but preserve anything entered manually (Zelle/Check/Cash/Notes)
 export function mergeCSVIntoMonth(
@@ -122,9 +150,12 @@ export function mergeCSVIntoMonth(
     // made it look like a single odd payment rather than a duplicated one.
     if (match.isMonthlyPayment) continue
 
-    // Weekly payment goes to its specific Friday
-    if (matchesByFriday[match.dueDate]) {
-      matchesByFriday[match.dueDate].push(match)
+    // Weekly payment goes to its specific Friday.
+    // Some tenants have non-Friday due dates in TenantCloud (e.g. Mondays).
+    // Snap to the Friday of that same rent week so the payment isn't silently dropped.
+    const friday = snapToFriday(match.dueDate, fridays)
+    if (friday && matchesByFriday[friday]) {
+      matchesByFriday[friday].push(match)
     }
   }
 
