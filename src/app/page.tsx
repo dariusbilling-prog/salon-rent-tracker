@@ -1,12 +1,13 @@
 'use client'
 
 import { useState, useMemo, useCallback, useRef, useEffect } from 'react'
+import Link from 'next/link'
 import {
   Upload, Plus, FileDown, ChevronLeft, ChevronRight,
   Check, AlertCircle, Clock, Gift, Heart, Calendar, Repeat,
   MessageSquare, Phone, Send, Loader2, StickyNote, X, BarChart3,
   TrendingUp, CreditCard, RefreshCw, Mail, CheckCircle2, Camera, Image,
-  Pencil, DoorOpen, UserPlus, ChevronDown, Archive, Wallet
+  Pencil, DoorOpen, UserPlus, ChevronDown, Archive, Wallet, Wrench
 } from 'lucide-react'
 import { Tenant, TenantWeekEntry, WeekStatus, PaymentType, BillingFrequency } from '@/types'
 import { TENANTS as DEFAULT_TENANTS } from '@/lib/tenant-data'
@@ -1178,6 +1179,13 @@ export default function RentTracker() {
                     </span>
                   )}
                 </button>
+                <Link
+                  href="/maintenance"
+                  title="Open the maintenance task board"
+                  className="px-3 py-1.5 bg-amber-600 text-white text-sm font-medium rounded-lg hover:bg-amber-700 flex items-center gap-1.5"
+                >
+                  <Wrench size={14} /> Task Board
+                </Link>
                 <button
                   onClick={handleExportPDF}
                   title={`Generate the ${monthLabel(monthKey)} P&L report`}

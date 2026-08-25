@@ -131,7 +131,7 @@ export async function sendBulkReminders(
       continue
     }
 
-    const result = await sendSMS(msg.message, formattedPhone, accountSid, authToken, fromNumber)
+    const result = await sendSMS(formattedPhone, msg.message, accountSid, authToken, fromNumber)
 
     results.push({
       tenantName: msg.tenantName,
