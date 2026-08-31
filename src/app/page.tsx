@@ -664,8 +664,12 @@ export default function RentTracker() {
     const amount = parseFloat(manualForm.amount)
     if (isNaN(amount) || amount <= 0) return
 
+    // The confirmation has to name the actual instrument. Stamping every
+    // non-card payment as "Cash" told the accountant a check was cash.
     const confirmation =
-      ['Zelle', 'Cash', 'Check', 'Money Order'].includes(manualForm.paymentType) ? 'Cash' : 'Card Processed'
+      ['Zelle', 'Cash', 'Check', 'Money Order'].includes(manualForm.paymentType)
+        ? manualForm.paymentType
+        : 'Card Processed'
 
     const tenant = activeTenants.find(t => t.id === manualForm.tenantId)
     const weeklyRent = tenant?.weeklyRent || 0
