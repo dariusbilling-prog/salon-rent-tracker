@@ -531,6 +531,16 @@ export function calculateMonthlySummary(data: MonthData): MonthlySummary {
     .sort((a, b) => b.weeks - a.weeks)
     .map(x => ({ tenant: x.tenant, weeksUnpaid: x.weeks }))
 
+  // Combine ACH + Card into one category (TenantCloud processes ACH as card)
+  if (paymentMethodBreakdown['ACH'] && paymentMethodBreakdown['Card']) {
+    paymentMethodBreakdown['ACH'].count += paymentMethodBreakdown['Card'].count
+    paymentMethodBreakdown['ACH'].total += paymentMethodBreakdown['Card'].total
+    delete paymentMethodBreakdown['Card']
+  } else if (paymentMethodBreakdown['Card'] && !paymentMethodBreakdown['ACH']) {
+    paymentMethodBreakdown['ACH'] = paymentMethodBreakdown['Card']
+    delete paymentMethodBreakdown['Card']
+  }
+
   return {
     totalExpected,
     totalCollected,
