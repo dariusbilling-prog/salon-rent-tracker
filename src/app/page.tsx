@@ -40,8 +40,17 @@ import {
 } from '@/lib/tenant-manager'
 import { initCloudSync } from '@/lib/cloud-sync'
 import {
-  MaintenanceEntry, loadMaintenance, saveMaintenance, maintenanceTotal, newMaintenanceId,
+  MaintenanceEntry, MaintenanceStatus, loadMaintenance, saveMaintenance, maintenanceTotal, newMaintenanceId,
 } from '@/lib/maintenance'
+import {
+  ReimbursementEntry, loadReimbursements, saveReimbursements, reimbursementsTotal, newReimbursementId,
+} from '@/lib/reimbursements'
+import {
+  FreeWeekLedger, loadFreeWeekLedger, saveFreeWeekLedger,
+  freeWeeksRemaining, freeWeeksUsed, freeWeeksEntitled,
+  setEntitlement, addEntitlement, recordFreeWeekUsage, removeFreeWeekUsage,
+  backfillFromMonthData, isWeekUsed,
+} from '@/lib/free-weeks'
 
 const WEEK_STATUSES: WeekStatus[] = ['paid', 'partial', 'late', 'unpaid', 'free_week', 'comped_week']
 const PAYMENT_TYPES: PaymentType[] = ['ACH', 'Zelle', 'Check', 'Cash', 'Money Order', 'Card']
@@ -53,7 +62,7 @@ const FREQUENCY_LABELS: Record<BillingFrequency, string> = {
   'monthly': 'Monthly',
 }
 
-type ActiveTab = string | 'monthly-summary'
+type ActiveTab = string | 'monthly-summary' | 'maintenance-jobs' | 'reimbursements'
 
 export default function RentTracker() {
   const [monthKey, setMonthKey] = useState<string>(() => getCurrentMonthKey())
@@ -105,6 +114,10 @@ export default function RentTracker() {
   // Credit prompt state
   const [creditPrompt, setCreditPrompt] = useState<{ tenantId: string; creditAmount: number; paymentContext: string } | null>(null)
 
+  // Free week tracking
+  const [freeWeekLedger, setFreeWeekLedger] = useState<FreeWeekLedger>(() => loadFreeWeekLedger())
+  const [freeWeekPopover, setFreeWeekPopover] = useState<string | null>(null) // tenantId or null
+
   const fileInputRef = useRef<HTMLInputElement>(null)
   const checkInputRef = useRef<HTMLInputElement>(null)
 
@@ -117,6 +130,15 @@ export default function RentTracker() {
   const updateMaintenance = useCallback((next: MaintenanceEntry[]) => {
     setMaintenance(next)
     saveMaintenance(monthKey, next)
+  }, [monthKey])
+
+  // Reimbursements — out-of-pocket expenses, also stored per month.
+  const [reimbursements, setReimbursements] = useState<ReimbursementEntry[]>([])
+  useEffect(() => { setReimbursements(loadReimbursements(monthKey)) }, [monthKey])
+
+  const updateReimbursements = useCallback((next: ReimbursementEntry[]) => {
+    setReimbursements(next)
+    saveReimbursements(monthKey, next)
   }, [monthKey])
 
   // Load month data from localStorage when month changes
@@ -156,6 +178,17 @@ export default function RentTracker() {
     })()
     return () => {
       cancelled = true
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // Backfill free week ledger from historical month data on mount
+  useEffect(() => {
+    const ledger = loadFreeWeekLedger()
+    const backfilled = backfillFromMonthData(ledger, listSavedMonths, loadMonthData as any)
+    if (JSON.stringify(backfilled) !== JSON.stringify(ledger)) {
+      saveFreeWeekLedger(backfilled)
+      setFreeWeekLedger(backfilled)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
@@ -518,6 +551,23 @@ export default function RentTracker() {
           }
         }
 
+        // Track free week usage in the ledger
+        if (updates.status === 'free_week' && e.status !== 'free_week') {
+          // Record free week usage
+          setFreeWeekLedger(prev => {
+            const next = recordFreeWeekUsage(prev, tenantId, monthData.monthKey, activeTab)
+            saveFreeWeekLedger(next)
+            return next
+          })
+        } else if (e.status === 'free_week' && updates.status && updates.status !== 'free_week') {
+          // Remove free week usage when changing away
+          setFreeWeekLedger(prev => {
+            const next = removeFreeWeekUsage(prev, tenantId, activeTab)
+            saveFreeWeekLedger(next)
+            return next
+          })
+        }
+
         if (updates.status === 'free_week' || updates.status === 'comped_week') {
           updated.amountPaid = 0
           updated.paymentType = undefined
@@ -529,7 +579,7 @@ export default function RentTracker() {
       })
       return { ...prev, weeks: { ...prev.weeks, [activeTab]: newEntries } }
     })
-  }, [activeTab])
+  }, [activeTab, monthData.monthKey])
 
   const updateFrequency = useCallback((tenantId: string, frequency: BillingFrequency) => {
     if (activeTab === 'monthly-summary' || !activeTab) return
@@ -633,9 +683,10 @@ export default function RentTracker() {
         entries: monthData.weeks[friday],
       })),
       maintenance,
+      reimbursements,
     })
     doc.save(`Salon Boutique Rockwall - ${monthName} P&L - ${year}.pdf`)
-  }, [monthKey, monthData, maintenance])
+  }, [monthKey, monthData, maintenance, reimbursements])
 
   // Manual entry
   const [manualForm, setManualForm] = useState({
@@ -1040,6 +1091,9 @@ export default function RentTracker() {
 
   const sortedFridays = useMemo(() => Object.keys(monthData.weeks).sort(), [monthData.weeks])
   const isMonthlySummaryTab = activeTab === 'monthly-summary'
+  const isMaintenanceTab = activeTab === 'maintenance-jobs'
+  const isReimbursementsTab = activeTab === 'reimbursements'
+  const isSpecialTab = isMonthlySummaryTab || isMaintenanceTab || isReimbursementsTab
 
   /**
    * Entries that still have nowhere to put their money.
@@ -1112,52 +1166,56 @@ export default function RentTracker() {
 
           {/* Action buttons */}
           <div className="flex items-center gap-2">
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept=".csv,.xlsx"
-              onChange={handleCSVFileSelect}
-              className="hidden"
-            />
-            <button
-              onClick={() => fileInputRef.current?.click()}
-              className="px-3 py-1.5 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700 flex items-center gap-1.5"
-              title="Upload monthly TenantCloud CSV"
-            >
-              {monthData.lastCSVUpload ? <RefreshCw size={14} /> : <Upload size={14} />}
-              {monthData.lastCSVUpload ? 'Refresh CSV' : 'Import CSV'}
-            </button>
+            {!(isMaintenanceTab || isReimbursementsTab) && (
+              <>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept=".csv,.xlsx"
+                  onChange={handleCSVFileSelect}
+                  className="hidden"
+                />
+                <button
+                  onClick={() => fileInputRef.current?.click()}
+                  className="px-3 py-1.5 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700 flex items-center gap-1.5"
+                  title="Upload monthly TenantCloud CSV"
+                >
+                  {monthData.lastCSVUpload ? <RefreshCw size={14} /> : <Upload size={14} />}
+                  {monthData.lastCSVUpload ? 'Refresh CSV' : 'Import CSV'}
+                </button>
 
-            {gmailConnected ? (
-              <button
-                onClick={() => { setShowZelleModal(true); setZelleMatches(null); setZelleError(null) }}
-                className="px-3 py-1.5 bg-violet-600 text-white text-sm font-medium rounded-lg hover:bg-violet-700 flex items-center gap-1.5"
-              >
-                <Mail size={14} /> Scan Zelle
-              </button>
-            ) : (
-              <a
-                href="/api/auth/google"
-                className="px-3 py-1.5 bg-white text-gray-700 text-sm font-medium rounded-lg border border-gray-300 hover:bg-gray-50 flex items-center gap-1.5"
-              >
-                <Mail size={14} /> Connect Gmail
-              </a>
+                {gmailConnected ? (
+                  <button
+                    onClick={() => { setShowZelleModal(true); setZelleMatches(null); setZelleError(null) }}
+                    className="px-3 py-1.5 bg-violet-600 text-white text-sm font-medium rounded-lg hover:bg-violet-700 flex items-center gap-1.5"
+                  >
+                    <Mail size={14} /> Scan Zelle
+                  </button>
+                ) : (
+                  <a
+                    href="/api/auth/google"
+                    className="px-3 py-1.5 bg-white text-gray-700 text-sm font-medium rounded-lg border border-gray-300 hover:bg-gray-50 flex items-center gap-1.5"
+                  >
+                    <Mail size={14} /> Connect Gmail
+                  </a>
+                )}
+                <input
+                  ref={checkInputRef}
+                  type="file"
+                  accept="image/*"
+                  multiple
+                  onChange={handleCheckImageSelect}
+                  className="hidden"
+                />
+                <button
+                  onClick={() => checkInputRef.current?.click()}
+                  className="px-3 py-1.5 bg-amber-600 text-white text-sm font-medium rounded-lg hover:bg-amber-700 flex items-center gap-1.5"
+                >
+                  <Camera size={14} /> Scan Checks
+                </button>
+              </>
             )}
-            <input
-              ref={checkInputRef}
-              type="file"
-              accept="image/*"
-              multiple
-              onChange={handleCheckImageSelect}
-              className="hidden"
-            />
-            <button
-              onClick={() => checkInputRef.current?.click()}
-              className="px-3 py-1.5 bg-amber-600 text-white text-sm font-medium rounded-lg hover:bg-amber-700 flex items-center gap-1.5"
-            >
-              <Camera size={14} /> Scan Checks
-            </button>
-            {!isMonthlySummaryTab && (
+            {!isSpecialTab && (
               <>
                 <button
                   onClick={() => setShowManualEntry(true)}
@@ -1238,6 +1296,28 @@ export default function RentTracker() {
             >
               <BarChart3 size={14} /> Monthly Summary
             </button>
+            <button
+              onClick={() => setActiveTab('maintenance-jobs')}
+              className={cn(
+                'px-4 py-2 text-sm font-medium border-b-2 transition-colors whitespace-nowrap flex items-center gap-1.5',
+                activeTab === 'maintenance-jobs'
+                  ? 'border-orange-600 text-orange-700'
+                  : 'border-transparent text-gray-500 hover:text-gray-700 hover:bg-gray-50'
+              )}
+            >
+              <Wrench size={14} /> Maintenance
+            </button>
+            <button
+              onClick={() => setActiveTab('reimbursements')}
+              className={cn(
+                'px-4 py-2 text-sm font-medium border-b-2 transition-colors whitespace-nowrap flex items-center gap-1.5',
+                activeTab === 'reimbursements'
+                  ? 'border-teal-600 text-teal-700'
+                  : 'border-transparent text-gray-500 hover:text-gray-700 hover:bg-gray-50'
+              )}
+            >
+              <Wallet size={14} /> Reimbursements
+            </button>
           </div>
         </div>
       </header>
@@ -1270,7 +1350,19 @@ export default function RentTracker() {
       )}
 
       <div className="max-w-[1400px] mx-auto px-4 py-4">
-        {isMonthlySummaryTab ? (
+        {isMaintenanceTab ? (
+          <MaintenanceJobsTab
+            monthLabel={monthLabel(monthKey)}
+            entries={maintenance}
+            onChange={updateMaintenance}
+          />
+        ) : isReimbursementsTab ? (
+          <ReimbursementsTab
+            monthLabel={monthLabel(monthKey)}
+            entries={reimbursements}
+            onChange={updateReimbursements}
+          />
+        ) : isMonthlySummaryTab ? (
           <MonthlySummaryView monthData={monthData} />
         ) : (
           <>
@@ -1356,6 +1448,19 @@ export default function RentTracker() {
                         onEditTenant={handleOpenEditTenant}
                         onMoveOutTenant={(id) => { setShowMoveOutConfirm(id); setMoveOutDate('') }}
                         onApplyCredit={handleApplyCredit}
+                        freeWeeksLeft={freeWeeksRemaining(freeWeekLedger, entry.tenant.id)}
+                        freeWeeksTotal={freeWeeksEntitled(freeWeekLedger, entry.tenant.id)}
+                        freeWeeksUsedCount={freeWeeksUsed(freeWeekLedger, entry.tenant.id)}
+                        onFreeWeekClick={() => setFreeWeekPopover(freeWeekPopover === entry.tenant.id ? null : entry.tenant.id)}
+                        showFreeWeekPopover={freeWeekPopover === entry.tenant.id}
+                        onSetEntitlement={(total) => {
+                          setFreeWeekLedger(prev => {
+                            const next = setEntitlement(prev, entry.tenant.id, total)
+                            saveFreeWeekLedger(next)
+                            return next
+                          })
+                        }}
+                        onCloseFreeWeekPopover={() => setFreeWeekPopover(null)}
                       />
                     ))}
                   </tbody>
@@ -2679,6 +2784,13 @@ function EntryRow({
   onEditTenant,
   onMoveOutTenant,
   onApplyCredit,
+  freeWeeksLeft,
+  freeWeeksTotal,
+  freeWeeksUsedCount,
+  onFreeWeekClick,
+  showFreeWeekPopover,
+  onSetEntitlement,
+  onCloseFreeWeekPopover,
 }: {
   entry: MonthTenantEntry
   credit: number
@@ -2692,6 +2804,13 @@ function EntryRow({
   onEditTenant: (tenantId: string) => void
   onMoveOutTenant: (tenantId: string) => void
   onApplyCredit: (tenantId: string) => void
+  freeWeeksLeft: number
+  freeWeeksTotal: number
+  freeWeeksUsedCount: number
+  onFreeWeekClick: () => void
+  showFreeWeekPopover: boolean
+  onSetEntitlement: (total: number) => void
+  onCloseFreeWeekPopover: () => void
 }) {
   const { tenant, status, isVacant } = entry
   const isSpecial = status === 'free_week' || status === 'comped_week'
@@ -2739,6 +2858,54 @@ function EntryRow({
             >
               <Wallet size={9} /> {formatCurrency(credit)}
             </button>
+          )}
+          {/* Free Week badge */}
+          {!isVacant && (
+            <div className="relative">
+              <button
+                onClick={onFreeWeekClick}
+                className={cn(
+                  'text-[10px] font-semibold px-1.5 py-0.5 rounded border cursor-pointer flex items-center gap-0.5',
+                  freeWeeksLeft > 0
+                    ? 'bg-indigo-50 text-indigo-700 border-indigo-200 hover:bg-indigo-100'
+                    : freeWeeksTotal === 0
+                      ? 'bg-gray-50 text-gray-400 border-gray-200 hover:bg-gray-100'
+                      : 'bg-red-50 text-red-600 border-red-200 hover:bg-red-100'
+                )}
+                title={`Free weeks: ${freeWeeksLeft} remaining of ${freeWeeksTotal} (${freeWeeksUsedCount} used)`}
+              >
+                <Gift size={9} /> {freeWeeksLeft}/{freeWeeksTotal}
+              </button>
+              {/* Popover for managing free weeks */}
+              {showFreeWeekPopover && (
+                <div className="absolute top-full left-0 mt-1 z-50 bg-white border border-gray-200 rounded-lg shadow-lg p-3 w-56">
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-xs font-bold text-gray-700">Free Weeks</span>
+                    <button onClick={onCloseFreeWeekPopover} className="text-gray-400 hover:text-gray-600"><X size={12} /></button>
+                  </div>
+                  <div className="space-y-1.5 text-xs text-gray-600">
+                    <div className="flex justify-between"><span>Entitled:</span><span className="font-mono font-bold">{freeWeeksTotal}</span></div>
+                    <div className="flex justify-between"><span>Used:</span><span className="font-mono font-bold text-orange-600">{freeWeeksUsedCount}</span></div>
+                    <div className="flex justify-between"><span>Remaining:</span><span className={cn('font-mono font-bold', freeWeeksLeft > 0 ? 'text-green-600' : 'text-red-600')}>{freeWeeksLeft}</span></div>
+                  </div>
+                  <div className="mt-2 pt-2 border-t border-gray-100">
+                    <label className="text-[10px] font-medium text-gray-500 block mb-1">Set Total Entitled</label>
+                    <div className="flex items-center gap-1">
+                      <button
+                        onClick={() => onSetEntitlement(Math.max(0, freeWeeksTotal - 1))}
+                        className="w-6 h-6 flex items-center justify-center border border-gray-200 rounded text-gray-500 hover:bg-gray-50 text-xs font-bold"
+                      >−</button>
+                      <span className="w-8 text-center font-mono font-bold text-sm">{freeWeeksTotal}</span>
+                      <button
+                        onClick={() => onSetEntitlement(freeWeeksTotal + 1)}
+                        className="w-6 h-6 flex items-center justify-center border border-indigo-200 rounded text-indigo-600 hover:bg-indigo-50 text-xs font-bold"
+                      >+</button>
+                    </div>
+                    <p className="text-[9px] text-gray-400 mt-1">+1 each lease renewal</p>
+                  </div>
+                </div>
+              )}
+            </div>
           )}
         </div>
       </td>
@@ -2998,6 +3165,366 @@ function Modal({ onClose, title, children, wide }: { onClose: () => void; title:
       <div className={cn('bg-white rounded-xl shadow-xl p-5 mx-4', wide ? 'w-full max-w-2xl' : 'w-full max-w-md')} onClick={e => e.stopPropagation()}>
         <h3 className="text-lg font-semibold text-gray-900 mb-3">{title}</h3>
         {children}
+      </div>
+    </div>
+  )
+}
+
+
+// ─── Maintenance Jobs Tab ────────────────────────────────────────────────────
+
+const MAINTENANCE_STATUSES: MaintenanceStatus[] = ['scheduled', 'in-progress', 'completed']
+const STATUS_COLORS: Record<MaintenanceStatus, string> = {
+  'scheduled': 'bg-blue-100 text-blue-800',
+  'in-progress': 'bg-yellow-100 text-yellow-800',
+  'completed': 'bg-green-100 text-green-800',
+}
+
+function MaintenanceJobsTab({
+  monthLabel: label,
+  entries,
+  onChange,
+}: {
+  monthLabel: string
+  entries: MaintenanceEntry[]
+  onChange: (next: MaintenanceEntry[]) => void
+}) {
+  const blank = { date: '', company: '', location: 'Building', activity: '', cost: '', notes: '', status: 'scheduled' as MaintenanceStatus }
+  const [form, setForm] = useState(blank)
+  const [editId, setEditId] = useState<string | null>(null)
+
+  const canAdd = form.date && form.activity && form.cost && parseFloat(form.cost) > 0
+
+  const add = () => {
+    if (!canAdd) return
+    if (editId) {
+      onChange(entries.map(e => e.id === editId ? {
+        ...e,
+        date: form.date,
+        company: form.company,
+        location: form.location || 'Building',
+        activity: form.activity,
+        cost: parseFloat(form.cost),
+        notes: form.notes,
+        status: form.status,
+      } : e))
+      setEditId(null)
+    } else {
+      onChange([...entries, {
+        id: newMaintenanceId(),
+        date: form.date,
+        company: form.company,
+        location: form.location || 'Building',
+        activity: form.activity,
+        cost: parseFloat(form.cost),
+        notes: form.notes,
+        status: form.status,
+      }])
+    }
+    setForm(blank)
+  }
+
+  const startEdit = (e: MaintenanceEntry) => {
+    setForm({
+      date: e.date,
+      company: e.company,
+      location: e.location,
+      activity: e.activity,
+      cost: String(e.cost),
+      notes: e.notes,
+      status: e.status || 'completed',
+    })
+    setEditId(e.id)
+  }
+
+  const total = maintenanceTotal(entries)
+  const sorted = [...entries].sort((a, b) => a.date.localeCompare(b.date))
+
+  return (
+    <div>
+      <div className="mb-4">
+        <h2 className="text-lg font-semibold text-gray-900 flex items-center gap-2">
+          <Wrench size={20} className="text-orange-600" /> Maintenance Jobs
+        </h2>
+        <p className="text-sm text-gray-500">{label} — track repairs, services, and invoices for the monthly report</p>
+      </div>
+
+      {/* Summary cards */}
+      <div className="grid grid-cols-4 gap-3 mb-4">
+        <div className="rounded-lg border border-blue-200 bg-blue-50 px-3 py-2">
+          <div className="text-lg font-bold text-blue-700">{entries.filter(e => (e.status || 'completed') === 'scheduled').length}</div>
+          <div className="text-xs font-medium text-blue-600 uppercase">Scheduled</div>
+        </div>
+        <div className="rounded-lg border border-yellow-200 bg-yellow-50 px-3 py-2">
+          <div className="text-lg font-bold text-yellow-700">{entries.filter(e => e.status === 'in-progress').length}</div>
+          <div className="text-xs font-medium text-yellow-600 uppercase">In Progress</div>
+        </div>
+        <div className="rounded-lg border border-green-200 bg-green-50 px-3 py-2">
+          <div className="text-lg font-bold text-green-700">{entries.filter(e => (e.status || 'completed') === 'completed').length}</div>
+          <div className="text-xs font-medium text-green-600 uppercase">Completed</div>
+        </div>
+        <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2">
+          <div className="text-lg font-bold text-red-700 font-mono">{formatCurrency(total)}</div>
+          <div className="text-xs font-medium text-red-600 uppercase">Total Cost</div>
+        </div>
+      </div>
+
+      {/* Table */}
+      {entries.length > 0 && (
+        <div className="bg-white rounded-lg border border-gray-200 overflow-hidden mb-4">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="text-left text-[11px] uppercase text-gray-500 border-b bg-gray-50">
+                <th className="py-2 px-3">Date</th>
+                <th className="px-3">Job / Activity</th>
+                <th className="px-3">Vendor</th>
+                <th className="px-3">Location</th>
+                <th className="px-3 text-right">Cost</th>
+                <th className="px-3">Status</th>
+                <th className="px-3">Notes</th>
+                <th className="px-3 w-20" />
+              </tr>
+            </thead>
+            <tbody>
+              {sorted.map(m => (
+                <tr key={m.id} className="border-b border-gray-100 hover:bg-gray-50">
+                  <td className="py-2 px-3 whitespace-nowrap">{m.date}</td>
+                  <td className="px-3 font-medium">{m.activity}</td>
+                  <td className="px-3">{m.company}</td>
+                  <td className="px-3">{m.location}</td>
+                  <td className="px-3 text-right font-mono text-red-700">{formatCurrency(m.cost)}</td>
+                  <td className="px-3">
+                    <select
+                      value={m.status || 'completed'}
+                      onChange={e => onChange(entries.map(x => x.id === m.id ? { ...x, status: e.target.value as MaintenanceStatus } : x))}
+                      className={cn('text-xs font-medium px-2 py-0.5 rounded-full border-0 cursor-pointer', STATUS_COLORS[m.status || 'completed'])}
+                    >
+                      {MAINTENANCE_STATUSES.map(s => (
+                        <option key={s} value={s}>{s === 'in-progress' ? 'In Progress' : s.charAt(0).toUpperCase() + s.slice(1)}</option>
+                      ))}
+                    </select>
+                  </td>
+                  <td className="px-3 text-gray-500 text-xs">{m.notes}</td>
+                  <td className="px-3 text-right">
+                    <button onClick={() => startEdit(m)} className="text-gray-400 hover:text-blue-600 mr-2" title="Edit">
+                      <Pencil size={14} />
+                    </button>
+                    <button onClick={() => onChange(entries.filter(x => x.id !== m.id))} className="text-gray-400 hover:text-red-600" title="Remove">
+                      <X size={14} />
+                    </button>
+                  </td>
+                </tr>
+              ))}
+              <tr className="bg-gray-50">
+                <td colSpan={4} className="py-2 px-3 text-right font-semibold text-gray-700">Total Maintenance</td>
+                <td className="px-3 text-right font-bold font-mono text-red-700">{formatCurrency(total)}</td>
+                <td colSpan={3} />
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {/* Add / Edit form */}
+      <div className="bg-white rounded-lg border border-gray-200 p-4">
+        <p className="text-xs font-semibold text-gray-600 uppercase mb-3">{editId ? 'Edit job' : 'Add a maintenance job'}</p>
+        <div className="grid grid-cols-7 gap-2">
+          <input type="date" value={form.date}
+            onChange={e => setForm(f => ({ ...f, date: e.target.value }))}
+            className="border border-gray-300 rounded px-2 py-1.5 text-sm" />
+          <input placeholder="Job / Activity" value={form.activity}
+            onChange={e => setForm(f => ({ ...f, activity: e.target.value }))}
+            className="border border-gray-300 rounded px-2 py-1.5 text-sm" />
+          <input placeholder="Vendor / Company" value={form.company}
+            onChange={e => setForm(f => ({ ...f, company: e.target.value }))}
+            className="border border-gray-300 rounded px-2 py-1.5 text-sm" />
+          <input placeholder="Building or suite" value={form.location}
+            onChange={e => setForm(f => ({ ...f, location: e.target.value }))}
+            className="border border-gray-300 rounded px-2 py-1.5 text-sm" />
+          <input placeholder="Cost" type="number" step="0.01" value={form.cost}
+            onChange={e => setForm(f => ({ ...f, cost: e.target.value }))}
+            className="border border-gray-300 rounded px-2 py-1.5 text-sm text-right" />
+          <select value={form.status}
+            onChange={e => setForm(f => ({ ...f, status: e.target.value as MaintenanceStatus }))}
+            className="border border-gray-300 rounded px-2 py-1.5 text-sm">
+            {MAINTENANCE_STATUSES.map(s => (
+              <option key={s} value={s}>{s === 'in-progress' ? 'In Progress' : s.charAt(0).toUpperCase() + s.slice(1)}</option>
+            ))}
+          </select>
+          <input placeholder="Invoice # / notes" value={form.notes}
+            onChange={e => setForm(f => ({ ...f, notes: e.target.value }))}
+            onKeyDown={e => { if (e.key === 'Enter') add() }}
+            className="border border-gray-300 rounded px-2 py-1.5 text-sm" />
+        </div>
+        <div className="flex gap-2 mt-3">
+          <button onClick={add} disabled={!canAdd}
+            className="px-4 py-2 bg-orange-600 text-white text-sm font-medium rounded-lg hover:bg-orange-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5">
+            {editId ? <><Check size={14} /> Save changes</> : <><Plus size={14} /> Add job</>}
+          </button>
+          {editId && (
+            <button onClick={() => { setEditId(null); setForm(blank) }}
+              className="px-4 py-2 bg-gray-200 text-gray-700 text-sm font-medium rounded-lg hover:bg-gray-300">
+              Cancel
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ─── Reimbursements Tab ──────────────────────────────────────────────────────
+
+function ReimbursementsTab({
+  monthLabel: label,
+  entries,
+  onChange,
+}: {
+  monthLabel: string
+  entries: ReimbursementEntry[]
+  onChange: (next: ReimbursementEntry[]) => void
+}) {
+  const blank = { date: '', name: '', purpose: '', cost: '', notes: '' }
+  const [form, setForm] = useState(blank)
+  const [editId, setEditId] = useState<string | null>(null)
+
+  const canAdd = form.date && form.name && form.cost && parseFloat(form.cost) > 0
+
+  const add = () => {
+    if (!canAdd) return
+    if (editId) {
+      onChange(entries.map(e => e.id === editId ? {
+        ...e,
+        date: form.date,
+        name: form.name,
+        purpose: form.purpose,
+        cost: parseFloat(form.cost),
+        notes: form.notes,
+      } : e))
+      setEditId(null)
+    } else {
+      onChange([...entries, {
+        id: newReimbursementId(),
+        date: form.date,
+        name: form.name,
+        purpose: form.purpose,
+        cost: parseFloat(form.cost),
+        notes: form.notes,
+      }])
+    }
+    setForm(blank)
+  }
+
+  const startEdit = (e: ReimbursementEntry) => {
+    setForm({
+      date: e.date,
+      name: e.name,
+      purpose: e.purpose,
+      cost: String(e.cost),
+      notes: e.notes || '',
+    })
+    setEditId(e.id)
+  }
+
+  const total = reimbursementsTotal(entries)
+  const sorted = [...entries].sort((a, b) => a.date.localeCompare(b.date))
+
+  return (
+    <div>
+      <div className="mb-4">
+        <h2 className="text-lg font-semibold text-gray-900 flex items-center gap-2">
+          <Wallet size={20} className="text-teal-600" /> Out-of-Pocket Reimbursements
+        </h2>
+        <p className="text-sm text-gray-500">{label} — items paid personally, to be reimbursed from the business account</p>
+      </div>
+
+      {/* Summary */}
+      <div className="grid grid-cols-2 gap-3 mb-4">
+        <div className="rounded-lg border border-teal-200 bg-teal-50 px-3 py-2">
+          <div className="text-lg font-bold text-teal-700">{entries.length}</div>
+          <div className="text-xs font-medium text-teal-600 uppercase">Items</div>
+        </div>
+        <div className="rounded-lg border border-teal-200 bg-teal-50 px-3 py-2">
+          <div className="text-lg font-bold text-teal-700 font-mono">{formatCurrency(total)}</div>
+          <div className="text-xs font-medium text-teal-600 uppercase">Total Reimbursement</div>
+        </div>
+      </div>
+
+      {/* Table */}
+      {entries.length > 0 && (
+        <div className="bg-white rounded-lg border border-gray-200 overflow-hidden mb-4">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="text-left text-[11px] uppercase text-gray-500 border-b bg-gray-50">
+                <th className="py-2 px-3">Date</th>
+                <th className="px-3">Item Name</th>
+                <th className="px-3">Purpose / Used For</th>
+                <th className="px-3 text-right">Cost</th>
+                <th className="px-3">Notes</th>
+                <th className="px-3 w-20" />
+              </tr>
+            </thead>
+            <tbody>
+              {sorted.map(r => (
+                <tr key={r.id} className="border-b border-gray-100 hover:bg-gray-50">
+                  <td className="py-2 px-3 whitespace-nowrap">{r.date}</td>
+                  <td className="px-3 font-medium">{r.name}</td>
+                  <td className="px-3">{r.purpose}</td>
+                  <td className="px-3 text-right font-mono text-teal-700">{formatCurrency(r.cost)}</td>
+                  <td className="px-3 text-gray-500 text-xs">{r.notes}</td>
+                  <td className="px-3 text-right">
+                    <button onClick={() => startEdit(r)} className="text-gray-400 hover:text-blue-600 mr-2" title="Edit">
+                      <Pencil size={14} />
+                    </button>
+                    <button onClick={() => onChange(entries.filter(x => x.id !== r.id))} className="text-gray-400 hover:text-red-600" title="Remove">
+                      <X size={14} />
+                    </button>
+                  </td>
+                </tr>
+              ))}
+              <tr className="bg-gray-50">
+                <td colSpan={3} className="py-2 px-3 text-right font-semibold text-gray-700">Total Reimbursement</td>
+                <td className="px-3 text-right font-bold font-mono text-teal-700">{formatCurrency(total)}</td>
+                <td colSpan={2} />
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {/* Add / Edit form */}
+      <div className="bg-white rounded-lg border border-gray-200 p-4">
+        <p className="text-xs font-semibold text-gray-600 uppercase mb-3">{editId ? 'Edit item' : 'Add a reimbursement'}</p>
+        <div className="grid grid-cols-5 gap-2">
+          <input type="date" value={form.date}
+            onChange={e => setForm(f => ({ ...f, date: e.target.value }))}
+            className="border border-gray-300 rounded px-2 py-1.5 text-sm" />
+          <input placeholder="Item name" value={form.name}
+            onChange={e => setForm(f => ({ ...f, name: e.target.value }))}
+            className="border border-gray-300 rounded px-2 py-1.5 text-sm" />
+          <input placeholder="What it's used for" value={form.purpose}
+            onChange={e => setForm(f => ({ ...f, purpose: e.target.value }))}
+            className="border border-gray-300 rounded px-2 py-1.5 text-sm" />
+          <input placeholder="Cost" type="number" step="0.01" value={form.cost}
+            onChange={e => setForm(f => ({ ...f, cost: e.target.value }))}
+            className="border border-gray-300 rounded px-2 py-1.5 text-sm text-right" />
+          <input placeholder="Notes (optional)" value={form.notes}
+            onChange={e => setForm(f => ({ ...f, notes: e.target.value }))}
+            onKeyDown={e => { if (e.key === 'Enter') add() }}
+            className="border border-gray-300 rounded px-2 py-1.5 text-sm" />
+        </div>
+        <div className="flex gap-2 mt-3">
+          <button onClick={add} disabled={!canAdd}
+            className="px-4 py-2 bg-teal-600 text-white text-sm font-medium rounded-lg hover:bg-teal-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5">
+            {editId ? <><Check size={14} /> Save changes</> : <><Plus size={14} /> Add item</>}
+          </button>
+          {editId && (
+            <button onClick={() => { setEditId(null); setForm(blank) }}
+              className="px-4 py-2 bg-gray-200 text-gray-700 text-sm font-medium rounded-lg hover:bg-gray-300">
+              Cancel
+            </button>
+          )}
+        </div>
       </div>
     </div>
   )
