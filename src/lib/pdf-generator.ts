@@ -3,6 +3,7 @@ import autoTable from 'jspdf-autotable'
 import { TenantWeekEntry } from '@/types'
 import { formatCurrency, getStatusLabel, fridayFullLabel, fridayShortLabel } from './utils'
 import { MaintenanceEntry, maintenanceTotal } from './maintenance'
+import { ReimbursementEntry, reimbursementsTotal } from './reimbursements'
 
 interface ReportData {
   weekLabel: string
@@ -233,6 +234,8 @@ export interface MonthlyReportData {
   year: string
   weeks: Array<{ friday: string; entries: TenantWeekEntry[] }>
   maintenance: MaintenanceEntry[]
+  /** Out-of-pocket items owed back to Darius. Section is skipped when empty. */
+  reimbursements?: ReimbursementEntry[]
 }
 
 /** Statuses where rent was deliberately not charged. */
@@ -509,6 +512,28 @@ export function generateMonthlyPDF(data: MonthlyReportData): jsPDF {
       if (d.section === 'body' && d.column.index === 4) d.cell.styles.textColor = [192, 0, 0]
     },
   })
+
+  // ---- 5. Out-of-Pocket Reimbursements (only when there are any) ----------
+  const reimb = data.reimbursements || []
+  if (reimb.length) {
+    const reimbTotal = reimbursementsTotal(reimb)
+    y = ensureRoom(((doc as any).lastAutoTable?.finalY || y) + 26, reimb.length)
+    section('Out-of-Pocket Reimbursements', y)
+    autoTable(doc, {
+      ...tableOpts,
+      startY: y + 8,
+      head: [['Date', 'Item', 'Purpose / Used For', 'Cost', 'Notes']],
+      body: [...reimb]
+        .sort((a, b) => a.date.localeCompare(b.date))
+        .map(r => [r.date, r.name, r.purpose, acc(r.cost), r.notes || '']),
+      foot: [['', '', 'Total Reimbursement', { content: acc(reimbTotal), styles: { halign: 'right' as const } }, '']],
+      footStyles: { fillColor: [242, 242, 242], textColor: [0, 0, 0], fontStyle: 'bold', fontSize: 9 },
+      columnStyles: {
+        0: { cellWidth: 70 }, 1: { cellWidth: 140 }, 2: { cellWidth: 160 },
+        3: { cellWidth: 100, halign: 'right' }, 4: { cellWidth: 'auto' },
+      },
+    })
+  }
 
   // ---- Weekly detail pages -------------------------------------------------
   for (const { friday, entries } of data.weeks) {

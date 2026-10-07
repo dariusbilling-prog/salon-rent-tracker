@@ -7,6 +7,9 @@
 
 import { pushKey } from './cloud-sync'
 
+/** Where a repair is in its life. Entries saved before this existed count as completed. */
+export type MaintenanceStatus = 'scheduled' | 'in-progress' | 'completed'
+
 export interface MaintenanceEntry {
   id: string
   /** ISO date the work happened. */
@@ -19,6 +22,8 @@ export interface MaintenanceEntry {
   cost: number
   /** Usually the invoice number. */
   notes: string
+  /** Missing on older entries — treat as 'completed'. */
+  status?: MaintenanceStatus
 }
 
 const PREFIX = 'salon-maintenance:'
