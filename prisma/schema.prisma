@@ -20,3 +20,27 @@ model AppState {
   json      Json
   updatedAt DateTime @updatedAt @default(now())
 }
+
+/// Tenant text messages captured from the iPhone (Shortcuts automation posts
+/// each incoming text to /api/inbox/inbound). Powers the /inbox page.
+/// The table is also created on first use by src/lib/inbox.ts, so no manual
+/// migration is needed — keep the two definitions in step.
+model InboxMessage {
+  id         String    @id
+  sender     String
+  phone      String?
+  body       String
+  receivedAt DateTime  @default(now())
+  tenantId   String?
+  tenantName String?
+  suite      String?
+  /// "open" until handled, then "done"
+  status     String    @default("open")
+  draft      String?
+  reply      String?
+  handledAt  DateTime?
+  task       String?
+  taskDone   Boolean   @default(false)
+
+  @@index([status])
+}
