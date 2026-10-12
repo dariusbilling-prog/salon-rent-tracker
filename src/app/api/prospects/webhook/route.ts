@@ -115,7 +115,7 @@ export async function POST(req: NextRequest) {
     try {
       const row = await prisma.appState.findUnique({ where: { key: STORAGE_KEY } })
       if (row?.json) {
-        existing = (Array.isArray(row.json) ? row.json : []) as Prospect[]
+        existing = (Array.isArray(row.json) ? row.json : []) as unknown as Prospect[]
       }
     } catch {
       // If key doesn't exist yet, start fresh
