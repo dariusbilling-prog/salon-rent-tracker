@@ -126,6 +126,21 @@ export default function RentTracker() {
   // Prospects
   const [prospects, setProspects] = useState<Prospect[]>(() => loadProspects())
 
+  // Merge prospects from cloud (picks up webhook-created leads)
+  useEffect(() => {
+    fetch('/api/prospects').then(r => r.ok ? r.json() : null).then((cloud: Prospect[] | null) => {
+      if (!cloud || !Array.isArray(cloud)) return
+      setProspects(prev => {
+        const localIds = new Set(prev.map(p => p.id))
+        const newFromCloud = cloud.filter(p => !localIds.has(p.id))
+        if (newFromCloud.length === 0) return prev
+        const merged = [...prev, ...newFromCloud]
+        saveProspects(merged)
+        return merged
+      })
+    }).catch(() => { /* offline — localStorage still works */ })
+  }, [])  // eslint-disable-line react-hooks/exhaustive-deps
+
   const fileInputRef = useRef<HTMLInputElement>(null)
   const checkInputRef = useRef<HTMLInputElement>(null)
 
