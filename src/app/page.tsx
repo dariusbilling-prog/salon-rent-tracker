@@ -7,7 +7,7 @@ import {
   Check, AlertCircle, Clock, Gift, Heart, Calendar, Repeat,
   MessageSquare, Phone, Send, Loader2, StickyNote, X, BarChart3,
   TrendingUp, CreditCard, RefreshCw, Mail, CheckCircle2, Camera, Image,
-  Pencil, DoorOpen, UserPlus, ChevronDown, Archive, Wallet, Wrench
+  Pencil, DoorOpen, UserPlus, ChevronDown, Archive, Wallet, Wrench, Users
 } from 'lucide-react'
 import { Tenant, TenantWeekEntry, WeekStatus, PaymentType, BillingFrequency } from '@/types'
 import { TENANTS as DEFAULT_TENANTS } from '@/lib/tenant-data'
@@ -46,6 +46,11 @@ import {
   ReimbursementEntry, loadReimbursements, saveReimbursements, reimbursementsTotal, newReimbursementId,
 } from '@/lib/reimbursements'
 import {
+  Prospect, ProspectStatus, loadProspects, saveProspects, createProspect,
+  activeProspects, prospectCounts, PROSPECT_STATUSES, STATUS_LABELS as PROSPECT_STATUS_LABELS,
+  STATUS_COLORS as PROSPECT_STATUS_COLORS, SOURCE_LABELS, newProspectId,
+} from '@/lib/prospects'
+import {
   FreeWeekLedger, loadFreeWeekLedger, saveFreeWeekLedger,
   freeWeeksRemaining, freeWeeksUsed, freeWeeksEntitled,
   setEntitlement, addEntitlement, recordFreeWeekUsage, removeFreeWeekUsage,
@@ -62,7 +67,7 @@ const FREQUENCY_LABELS: Record<BillingFrequency, string> = {
   'monthly': 'Monthly',
 }
 
-type ActiveTab = string | 'monthly-summary' | 'maintenance-jobs' | 'reimbursements'
+type ActiveTab = string | 'monthly-summary' | 'maintenance-jobs' | 'reimbursements' | 'prospects'
 
 export default function RentTracker() {
   const [monthKey, setMonthKey] = useState<string>(() => getCurrentMonthKey())
@@ -117,6 +122,9 @@ export default function RentTracker() {
   // Free week tracking
   const [freeWeekLedger, setFreeWeekLedger] = useState<FreeWeekLedger>(() => loadFreeWeekLedger())
   const [freeWeekPopover, setFreeWeekPopover] = useState<string | null>(null) // tenantId or null
+
+  // Prospects
+  const [prospects, setProspects] = useState<Prospect[]>(() => loadProspects())
 
   const fileInputRef = useRef<HTMLInputElement>(null)
   const checkInputRef = useRef<HTMLInputElement>(null)
@@ -1093,7 +1101,8 @@ export default function RentTracker() {
   const isMonthlySummaryTab = activeTab === 'monthly-summary'
   const isMaintenanceTab = activeTab === 'maintenance-jobs'
   const isReimbursementsTab = activeTab === 'reimbursements'
-  const isSpecialTab = isMonthlySummaryTab || isMaintenanceTab || isReimbursementsTab
+  const isProspectsTab = activeTab === 'prospects'
+  const isSpecialTab = isMonthlySummaryTab || isMaintenanceTab || isReimbursementsTab || isProspectsTab
 
   /**
    * Entries that still have nowhere to put their money.
@@ -1166,7 +1175,7 @@ export default function RentTracker() {
 
           {/* Action buttons */}
           <div className="flex items-center gap-2">
-            {!(isMaintenanceTab || isReimbursementsTab) && (
+            {!(isMaintenanceTab || isReimbursementsTab || isProspectsTab) && (
               <>
                 <input
                   ref={fileInputRef}
@@ -1318,6 +1327,22 @@ export default function RentTracker() {
             >
               <Wallet size={14} /> Reimbursements
             </button>
+            <button
+              onClick={() => setActiveTab('prospects')}
+              className={cn(
+                'px-4 py-2 text-sm font-medium border-b-2 transition-colors whitespace-nowrap flex items-center gap-1.5',
+                activeTab === 'prospects'
+                  ? 'border-violet-600 text-violet-700'
+                  : 'border-transparent text-gray-500 hover:text-gray-700 hover:bg-gray-50'
+              )}
+            >
+              <Users size={14} /> Prospects
+              {activeProspects(prospects).length > 0 && (
+                <span className="ml-1 text-[10px] font-bold bg-violet-100 text-violet-700 px-1.5 py-0.5 rounded-full">
+                  {activeProspects(prospects).length}
+                </span>
+              )}
+            </button>
           </div>
         </div>
       </header>
@@ -1350,7 +1375,12 @@ export default function RentTracker() {
       )}
 
       <div className="max-w-[1400px] mx-auto px-4 py-4">
-        {isMaintenanceTab ? (
+        {isProspectsTab ? (
+          <ProspectsTab
+            prospects={prospects}
+            onChange={(updated) => { setProspects(updated); saveProspects(updated) }}
+          />
+        ) : isMaintenanceTab ? (
           <MaintenanceJobsTab
             monthLabel={monthLabel(monthKey)}
             entries={maintenance}
@@ -3658,6 +3688,288 @@ function MaintenanceModal({
           </button>
         </div>
       </div>
+    </div>
+  )
+}
+
+// ─── Prospects Tab ────────────────────────────────────────────────
+
+function ProspectsTab({ prospects, onChange }: {
+  prospects: Prospect[]
+  onChange: (updated: Prospect[]) => void
+}) {
+  const [showForm, setShowForm] = useState(false)
+  const [editingId, setEditingId] = useState<string | null>(null)
+  const [showArchived, setShowArchived] = useState(false)
+  const [sortBy, setSortBy] = useState<'date' | 'name' | 'status'>('date')
+  const [form, setForm] = useState({
+    name: '', phone: '', email: '', suiteInterest: '',
+    source: 'ebi' as Prospect['source'], notes: '', status: 'new' as ProspectStatus,
+  })
+
+  const counts = prospectCounts(prospects)
+  const active = activeProspects(prospects)
+  const archived = prospects.filter(p => p.status === 'archived')
+
+  const displayed = (showArchived ? prospects : active).sort((a, b) => {
+    if (sortBy === 'name') return a.name.localeCompare(b.name)
+    if (sortBy === 'status') return PROSPECT_STATUSES.indexOf(a.status) - PROSPECT_STATUSES.indexOf(b.status)
+    return b.createdAt.localeCompare(a.createdAt) // newest first
+  })
+
+  const resetForm = () => {
+    setForm({ name: '', phone: '', email: '', suiteInterest: '', source: 'ebi', notes: '', status: 'new' })
+    setEditingId(null)
+    setShowForm(false)
+  }
+
+  const startEdit = (p: Prospect) => {
+    setForm({
+      name: p.name, phone: p.phone, email: p.email, suiteInterest: p.suiteInterest,
+      source: p.source, notes: p.notes, status: p.status,
+    })
+    setEditingId(p.id)
+    setShowForm(true)
+  }
+
+  const save = () => {
+    if (!form.name.trim()) return
+    const now = new Date().toISOString()
+    if (editingId) {
+      onChange(prospects.map(p => p.id === editingId ? {
+        ...p, ...form, name: form.name.trim(), updatedAt: now,
+      } : p))
+    } else {
+      const newP = createProspect({
+        name: form.name.trim(), phone: form.phone.trim(), email: form.email.trim(),
+        suiteInterest: form.suiteInterest.trim(), source: form.source, notes: form.notes.trim(),
+        status: form.status,
+      })
+      onChange([...prospects, newP])
+    }
+    resetForm()
+  }
+
+  const updateStatus = (id: string, status: ProspectStatus) => {
+    onChange(prospects.map(p => p.id === id ? { ...p, status, updatedAt: new Date().toISOString() } : p))
+  }
+
+  const deleteProspect = (id: string) => {
+    onChange(prospects.filter(p => p.id !== id))
+  }
+
+  return (
+    <div className="space-y-4">
+      {/* Summary cards */}
+      <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-6 gap-3">
+        {(PROSPECT_STATUSES.filter(s => s !== 'archived') as ProspectStatus[]).map(status => (
+          <div key={status} className={cn(
+            'rounded-lg border px-3 py-2 text-center',
+            PROSPECT_STATUS_COLORS[status]
+          )}>
+            <div className="text-2xl font-bold">{counts[status]}</div>
+            <div className="text-[10px] font-semibold uppercase tracking-wide">{PROSPECT_STATUS_LABELS[status]}</div>
+          </div>
+        ))}
+        <div className="rounded-lg border px-3 py-2 text-center bg-violet-50 text-violet-700 border-violet-200">
+          <div className="text-2xl font-bold">{active.length}</div>
+          <div className="text-[10px] font-semibold uppercase tracking-wide">Total Active</div>
+        </div>
+      </div>
+
+      {/* Toolbar */}
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => { resetForm(); setShowForm(true) }}
+            className="px-4 py-2 bg-violet-600 text-white text-sm font-medium rounded-lg hover:bg-violet-700 flex items-center gap-1.5"
+          >
+            <Plus size={14} /> Add Prospect
+          </button>
+          <select
+            value={sortBy}
+            onChange={e => setSortBy(e.target.value as typeof sortBy)}
+            className="text-xs border border-gray-200 rounded px-2 py-1.5 bg-white text-gray-600"
+          >
+            <option value="date">Sort: Newest First</option>
+            <option value="name">Sort: Name</option>
+            <option value="status">Sort: Status</option>
+          </select>
+        </div>
+        {archived.length > 0 && (
+          <button
+            onClick={() => setShowArchived(!showArchived)}
+            className="text-xs text-gray-500 hover:text-gray-700 flex items-center gap-1"
+          >
+            <Archive size={12} /> {showArchived ? 'Hide' : 'Show'} Archived ({archived.length})
+          </button>
+        )}
+      </div>
+
+      {/* Add/Edit Form */}
+      {showForm && (
+        <div className="bg-violet-50/50 border border-violet-200 rounded-lg p-4">
+          <p className="text-sm font-bold text-violet-800 mb-3">{editingId ? 'Edit Prospect' : 'New Prospect'}</p>
+          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
+            <input
+              placeholder="Name *"
+              value={form.name}
+              onChange={e => setForm(f => ({ ...f, name: e.target.value }))}
+              className="border border-gray-300 rounded px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-violet-400"
+              autoFocus
+            />
+            <input
+              placeholder="Phone"
+              type="tel"
+              value={form.phone}
+              onChange={e => setForm(f => ({ ...f, phone: e.target.value }))}
+              className="border border-gray-300 rounded px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-violet-400"
+            />
+            <input
+              placeholder="Email"
+              type="email"
+              value={form.email}
+              onChange={e => setForm(f => ({ ...f, email: e.target.value }))}
+              className="border border-gray-300 rounded px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-violet-400"
+            />
+            <input
+              placeholder="Suite interest (e.g. 114, any)"
+              value={form.suiteInterest}
+              onChange={e => setForm(f => ({ ...f, suiteInterest: e.target.value }))}
+              className="border border-gray-300 rounded px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-violet-400"
+            />
+            <select
+              value={form.source}
+              onChange={e => setForm(f => ({ ...f, source: e.target.value as Prospect['source'] }))}
+              className="border border-gray-300 rounded px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-violet-400 bg-white"
+            >
+              {Object.entries(SOURCE_LABELS).map(([val, label]) => (
+                <option key={val} value={val}>{label}</option>
+              ))}
+            </select>
+            <select
+              value={form.status}
+              onChange={e => setForm(f => ({ ...f, status: e.target.value as ProspectStatus }))}
+              className="border border-gray-300 rounded px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-violet-400 bg-white"
+            >
+              {PROSPECT_STATUSES.map(s => (
+                <option key={s} value={s}>{PROSPECT_STATUS_LABELS[s]}</option>
+              ))}
+            </select>
+          </div>
+          <textarea
+            placeholder="Notes (optional)"
+            value={form.notes}
+            onChange={e => setForm(f => ({ ...f, notes: e.target.value }))}
+            rows={2}
+            className="mt-3 w-full border border-gray-300 rounded px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-violet-400"
+          />
+          <div className="mt-3 flex items-center gap-2">
+            <button
+              onClick={save}
+              disabled={!form.name.trim()}
+              className="px-4 py-2 bg-violet-600 text-white text-sm font-medium rounded-lg hover:bg-violet-700 disabled:opacity-50 flex items-center gap-1.5"
+            >
+              <Check size={14} /> {editingId ? 'Save Changes' : 'Add Prospect'}
+            </button>
+            <button
+              onClick={resetForm}
+              className="px-4 py-2 text-gray-600 text-sm font-medium rounded-lg hover:bg-gray-100"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Table */}
+      {displayed.length === 0 ? (
+        <div className="text-center py-12 text-gray-400">
+          <Users size={36} className="mx-auto mb-3 opacity-50" />
+          <p className="text-sm font-medium">No prospects yet</p>
+          <p className="text-xs mt-1">Click &ldquo;Add Prospect&rdquo; to start tracking leads</p>
+        </div>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="bg-gray-50 border-b border-gray-200">
+                <th className="px-3 py-2 text-left text-[10px] font-semibold text-gray-500 uppercase">Name</th>
+                <th className="px-3 py-2 text-left text-[10px] font-semibold text-gray-500 uppercase">Phone</th>
+                <th className="px-3 py-2 text-left text-[10px] font-semibold text-gray-500 uppercase">Email</th>
+                <th className="px-3 py-2 text-left text-[10px] font-semibold text-gray-500 uppercase">Suite</th>
+                <th className="px-3 py-2 text-left text-[10px] font-semibold text-gray-500 uppercase">Source</th>
+                <th className="px-3 py-2 text-left text-[10px] font-semibold text-gray-500 uppercase">Status</th>
+                <th className="px-3 py-2 text-left text-[10px] font-semibold text-gray-500 uppercase">Added</th>
+                <th className="px-3 py-2 text-left text-[10px] font-semibold text-gray-500 uppercase">Notes</th>
+                <th className="px-3 py-2 w-20"></th>
+              </tr>
+            </thead>
+            <tbody>
+              {displayed.map(p => (
+                <tr key={p.id} className={cn(
+                  'border-b border-gray-100 hover:bg-gray-50/50 transition-colors',
+                  p.status === 'archived' && 'opacity-50'
+                )}>
+                  <td className="px-3 py-2 font-medium text-gray-900">{p.name}</td>
+                  <td className="px-3 py-2 text-gray-600 font-mono text-xs">
+                    {p.phone ? (
+                      <a href={`tel:${p.phone}`} className="hover:text-violet-600">{p.phone}</a>
+                    ) : <span className="text-gray-300">—</span>}
+                  </td>
+                  <td className="px-3 py-2 text-gray-600 text-xs">
+                    {p.email ? (
+                      <a href={`mailto:${p.email}`} className="hover:text-violet-600">{p.email}</a>
+                    ) : <span className="text-gray-300">—</span>}
+                  </td>
+                  <td className="px-3 py-2 text-gray-600 font-mono">{p.suiteInterest || '—'}</td>
+                  <td className="px-3 py-2">
+                    <span className="text-[10px] font-medium text-gray-500">{SOURCE_LABELS[p.source]}</span>
+                  </td>
+                  <td className="px-3 py-2">
+                    <select
+                      value={p.status}
+                      onChange={e => updateStatus(p.id, e.target.value as ProspectStatus)}
+                      className={cn(
+                        'text-xs font-medium border rounded px-1.5 py-1 focus:outline-none focus:ring-1 focus:ring-violet-400 cursor-pointer',
+                        PROSPECT_STATUS_COLORS[p.status]
+                      )}
+                    >
+                      {PROSPECT_STATUSES.map(s => (
+                        <option key={s} value={s}>{PROSPECT_STATUS_LABELS[s]}</option>
+                      ))}
+                    </select>
+                  </td>
+                  <td className="px-3 py-2 text-xs text-gray-400">
+                    {new Date(p.createdAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
+                  </td>
+                  <td className="px-3 py-2 text-xs text-gray-500 max-w-[200px] truncate" title={p.notes}>
+                    {p.notes || '—'}
+                  </td>
+                  <td className="px-3 py-2">
+                    <div className="flex items-center gap-0.5">
+                      <button
+                        onClick={() => startEdit(p)}
+                        className="p-1 text-gray-400 hover:text-violet-600 hover:bg-violet-50 rounded"
+                        title="Edit"
+                      >
+                        <Pencil size={13} />
+                      </button>
+                      <button
+                        onClick={() => deleteProspect(p.id)}
+                        className="p-1 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded"
+                        title="Delete"
+                      >
+                        <X size={13} />
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
     </div>
   )
 }
