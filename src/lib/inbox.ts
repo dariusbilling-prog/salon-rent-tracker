@@ -99,10 +99,46 @@ export async function loadTenants(): Promise<Tenant[]> {
   return Array.isArray(list) ? (list as unknown as Tenant[]) : []
 }
 
+// Words in contact names that say nothing about who the person is.
+const NOISE = new Set(['suite', 'suites', 'hair', 'stylist', 'salon', 'nails', 'lashes', 'brows', 'barber', 'the', 'and', 'iphone'])
+
+function words(s: string): string[] {
+  return s
+    .toLowerCase()
+    .split(/[^a-z]+/)
+    .filter((w) => w.length >= 3 && !NOISE.has(w))
+}
+
+/**
+ * True when two names are a spelling slip apart: one letter for short names
+ * (Kelli/Kellli, Leah/Leeah), two for names of six letters or more (Stacie/Stacey).
+ */
+function nearlySame(a: string, b: string): boolean {
+  if (a === b) return true
+  const shorter = Math.min(a.length, b.length)
+  if (shorter < 4) return false
+  const allowed = shorter >= 6 ? 2 : 1
+  if (Math.abs(a.length - b.length) > allowed) return false
+  // Levenshtein distance, small strings only.
+  let prev = Array.from({ length: b.length + 1 }, (_, j) => j)
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i]
+    for (let j = 1; j <= b.length; j++) {
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1))
+    }
+    prev = cur
+  }
+  return prev[b.length] <= allowed
+}
+
 /**
  * Work out which tenant a text came from. The Shortcut usually sends the
  * contact name as saved on the phone ("Leah Suite 135"), sometimes a raw number.
- * Tries, in order: phone number, suite number in the name, tenant name.
+ *
+ * Phone contact names drift from the tracker — old suite numbers, different
+ * spellings — so names decide and the suite number only breaks ties:
+ *   exact name word +3, one-letter-off name word +2, suite number +1.
+ * A sender with no name words at all (just "Suite 122") falls back to the suite.
  */
 export function matchTenant(sender: string, phone: string | null, tenants: Tenant[]): Tenant | null {
   const active = tenants.filter((t) => t.isActive !== false && !t.isArchived)
@@ -113,23 +149,33 @@ export function matchTenant(sender: string, phone: string | null, tenants: Tenan
     if (byPhone) return byPhone
   }
 
-  const lower = sender.toLowerCase()
+  const senderWords = words(sender)
+  const senderSuites: string[] = phoneDigits(sender) ? [] : sender.match(/\b\d{3}\b/g) || []
 
-  const suiteMatch = lower.match(/\b(\d{3})\b/)
-  if (suiteMatch) {
-    const bySuite = active.filter((t) => String(t.suiteNumber).replace(/\D/g, '') === suiteMatch[1])
-    if (bySuite.length === 1) return bySuite[0]
+  let best: Tenant | null = null
+  let bestScore = 0
+  let tie = false
+  for (const t of active) {
+    const nameWords = words(`${t.name} ${t.secondName || ''}`)
+    const suites = String(t.suiteNumber).split(/[^0-9]+/).filter(Boolean)
+    let score = 0
+    for (const w of senderWords) {
+      if (nameWords.includes(w)) score += 3
+      else if (nameWords.some((n) => nearlySame(n, w))) score += 2
+    }
+    if (senderSuites.some((s) => suites.includes(s))) score += 1
+    if (score > bestScore) {
+      best = t
+      bestScore = score
+      tie = false
+    } else if (score === bestScore && score > 0) {
+      tie = true
+    }
   }
-
-  const byFull = active.filter((t) => t.name && lower.includes(t.name.toLowerCase()))
-  if (byFull.length === 1) return byFull[0]
-
-  const first = lower.split(/[\s\-–,]+/)[0]
-  if (first.length >= 3) {
-    const byFirst = active.filter((t) => t.name.toLowerCase().split(/[\s,/&]+/)[0] === first)
-    if (byFirst.length === 1) return byFirst[0]
-  }
-  return null
+  if (!best || tie) return null
+  // A bare suite number only counts when the sender had no name to go on.
+  if (bestScore < 2 && senderWords.length > 0) return null
+  return best
 }
 
 /** Messages from the same person share a thread key. */

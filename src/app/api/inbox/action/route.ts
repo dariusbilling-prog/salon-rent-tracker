@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/db'
-import { checkKey, ensureTable } from '@/lib/inbox'
+import { checkKey, ensureTable, loadTenants, matchTenant } from '@/lib/inbox'
 
 export const dynamic = 'force-dynamic'
 
@@ -11,6 +11,7 @@ export const dynamic = 'force-dynamic'
  *   { action: 'draft',    ids: string[], text: string }    — save an edited draft
  *   { action: 'task',     id: string,    text: string }    — add to the to-do list
  *   { action: 'taskdone', id: string }
+ *   { action: 'rematch' }                                  — re-run tenant matching on open messages
  */
 export async function POST(req: NextRequest) {
   const denied = checkKey(req)
@@ -50,6 +51,24 @@ export async function POST(req: NextRequest) {
         if (!id) return NextResponse.json({ error: 'id required' }, { status: 400 })
         await prisma.inboxMessage.update({ where: { id }, data: { taskDone: true } })
         break
+      case 'rematch': {
+        const [open, tenants] = await Promise.all([
+          prisma.inboxMessage.findMany({ where: { status: 'open' } }),
+          loadTenants(),
+        ])
+        for (const m of open) {
+          const t = matchTenant(m.sender, m.phone, tenants)
+          await prisma.inboxMessage.update({
+            where: { id: m.id },
+            data: {
+              tenantId: t?.id ?? null,
+              tenantName: t?.name ?? null,
+              suite: t?.suiteNumber ? String(t.suiteNumber) : null,
+            },
+          })
+        }
+        return NextResponse.json({ ok: true, rematched: open.length })
+      }
       default:
         return NextResponse.json({ error: 'unknown action' }, { status: 400 })
     }
